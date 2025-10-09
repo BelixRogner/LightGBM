@@ -36,7 +36,7 @@ class CUDAGradientDiscretizer: public GradientDiscretizer {
     const score_t* input_gradients,
     const score_t* input_hessians) override;
 
-  const int8_t* discretized_gradients_and_hessians() const override { return discretized_gradients_and_hessians_.RawData(); }
+  const int8_t* discretized_gradients_and_hessians() const override { return reinterpret_cast<const int8_t*>( discretized_gradients_and_hessians_.RawData()); }
 
   double grad_scale() const override {
     Log::Fatal("grad_scale() of CUDAGradientDiscretizer should not be called.");
@@ -101,7 +101,7 @@ class CUDAGradientDiscretizer: public GradientDiscretizer {
   }
 
  protected:
-  mutable CUDAVector<int8_t> discretized_gradients_and_hessians_;
+  mutable CUDAVector<int16_t> discretized_gradients_and_hessians_;
   mutable CUDAVector<score_t> grad_min_block_buffer_;
   mutable CUDAVector<score_t> grad_max_block_buffer_;
   mutable CUDAVector<score_t> hess_min_block_buffer_;

@@ -312,6 +312,10 @@ void SerialTreeLearner::BeforeTrain() {
         gradient_discretizer_->discretized_gradients_and_hessians(),
         gradient_discretizer_->grad_scale(),
         gradient_discretizer_->hess_scale());
+      Log::Warning("sum_gradients = %f, sum_hessians = %f", smaller_leaf_splits_->sum_gradients(), smaller_leaf_splits_->sum_hessians());
+      int64_t int_sum_gradients_and_hessians = smaller_leaf_splits_->int_sum_gradients_and_hessians();
+      Log::Warning("int_sum_gradient = %d", (int_sum_gradients_and_hessians & 0xffffffff00000000) >> 32);
+      Log::Warning("int_sum_hessian = %d", int_sum_gradients_and_hessians & 0x00000000ffffffff);
     }
   } else {
     // use bagging, only use part of data
