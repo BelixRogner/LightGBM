@@ -434,6 +434,25 @@ void SerialTreeLearner::ConstructHistograms(
     } else {
       train_data_->ConstructHistograms<true, 32>(SMALLER_LEAF_ARGS);
     }
+
+    if (smaller_leaf_num_bits <= 16) {
+      const int32_t* ptr_smaller_leaf_hist_data_int32_t = reinterpret_cast<const int32_t*>(ptr_smaller_leaf_hist_data);
+      for (int i = 0; i < 100; ++i) {
+        const int32_t grad_and_hess = ptr_smaller_leaf_hist_data_int32_t[i];
+        const int16_t grad = (grad_and_hess & 0xffff0000) >> 16;
+        const uint16_t hess = static_cast<uint16_t>(grad_and_hess & 0x0000ffff);
+        Log::Warning("i = %d, grad = %d, hess = %d", i, grad, hess);
+      }
+    } else {
+      const int64_t* ptr_smaller_leaf_hist_data_int64_t = reinterpret_cast<const int64_t*>(ptr_smaller_leaf_hist_data);
+      for (int i = 0; i < 100; ++i) {
+        const int64_t grad_and_hess = ptr_smaller_leaf_hist_data_int64_t[i];
+        const int32_t grad = (grad_and_hess & 0xffffffff00000000) >> 32;
+        const uint32_t hess = static_cast<uint32_t>(grad_and_hess & 0x00000000ffffffff);
+        Log::Warning("i = %d, grad = %d, hess = %d", i, grad, hess);
+      }
+    }
+
     #undef SMALLER_LEAF_ARGS
     if (larger_leaf_histogram_array_ && !use_subtract) {
       const uint8_t larger_leaf_num_bits = gradient_discretizer_->GetHistBitsInLeaf<false>(larger_leaf_splits_->leaf_index());
