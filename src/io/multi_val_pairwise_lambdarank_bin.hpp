@@ -63,6 +63,31 @@ class MultiValDensePairwiseLambdarankBin: public MultiValPairwiseLambdarankBin<B
                                               gradients, hessians, out);
   }
 
+
+  // for (int pair_index = 0; pair_index < num_pairs; ++pair_index) {
+  //    float gradient = pair_gradients[pair_index];
+  //    for (int feature_index = 0; feature_index < num_features; ++feature_index) {
+  //        int first_point_index = pairs[pair_index].first;
+  //        int bin = bins[feature_index][first_point_index];
+  //        first_feature_histogram[feature_index][bin] += gradient;
+  //    }
+  // }
+
+
+  // for (int pair_index = 0; pair_index < num_pairs; ++pair_index) {
+  //    float gradient = pair_gradients[pair_index];
+  //    int first_point_index = pairs[pair_index].first;
+  //    first_point_gradients[first_point_index] += gradient;
+  // }
+  // for (int point_index = 0; point_index < num_points; ++point_index) {
+  //    for (int feature_index = 0; feature_index < num_features; ++feature_index) {
+  //        float point_gradient = first_point_gradients[point_index];
+  //        int bin = bins[feature_index][point_index];
+  //        first_feature_histogram[feature_index][bin] += gradient;
+  //    }
+  // }
+
+
   template<bool USE_INDICES, bool USE_PREFETCH, bool ORDERED>
   void ConstructHistogramInner(const data_size_t* data_indices, data_size_t start, data_size_t end,
     const score_t* gradients, const score_t* hessians, hist_t* out) const {
