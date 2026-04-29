@@ -489,7 +489,7 @@ jobs:
       - test
       - test-linux-aarch64
     runs-on: ubuntu-latest
-    # publish whenever a push is made to master
+    # publish whenever a new commit is pushed to 'master'
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     environment:
       name: nightly-python-uploads
