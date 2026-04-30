@@ -1,5 +1,6 @@
 /*!
- * Copyright (c) 2021 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2021-2026 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2021-2026 The LightGBM developers. All rights reserved.
  * Licensed under the MIT License. See LICENSE file in the project root for
  * license information.
  */
@@ -96,12 +97,11 @@ __global__ void DiscretizeGradientsKernel(
   const score_t* gradient_random_values,
   const score_t* hessian_random_values,
   const int grad_discretize_bins,
-  int8_t* output_gradients_and_hessians) {
+  int16_t* output_gradients_and_hessians) {
   const int start = random_values_use_start[iter];
   const data_size_t index = static_cast<data_size_t>(threadIdx.x + blockIdx.x * blockDim.x);
   const score_t grad_scale = *grad_scale_ptr;
   const score_t hess_scale = *hess_scale_ptr;
-  int16_t* output_gradients_and_hessians_ptr = reinterpret_cast<int16_t*>(output_gradients_and_hessians);
   if (index < num_data) {
     if (STOCHASTIC_ROUNDING) {
       const data_size_t index_offset = (index + start) % num_data;
@@ -109,17 +109,17 @@ __global__ void DiscretizeGradientsKernel(
       const score_t hessian = input_hessians[index];
       const score_t gradient_random_value = gradient_random_values[index_offset];
       const score_t hessian_random_value = hessian_random_values[index_offset];
-      output_gradients_and_hessians_ptr[2 * index + 1] = gradient > 0.0f ?
+      output_gradients_and_hessians[2 * index + 1] = gradient > 0.0f ?
         static_cast<int16_t>(gradient * grad_scale + gradient_random_value) :
         static_cast<int16_t>(gradient * grad_scale - gradient_random_value);
-      output_gradients_and_hessians_ptr[2 * index] = static_cast<int16_t>(hessian * hess_scale + hessian_random_value);
+      output_gradients_and_hessians[2 * index] = static_cast<int16_t>(hessian * hess_scale + hessian_random_value);
     } else {
       const score_t gradient = input_gradients[index];
       const score_t hessian = input_hessians[index];
-      output_gradients_and_hessians_ptr[2 * index + 1] = gradient > 0.0f ?
+      output_gradients_and_hessians[2 * index + 1] = gradient > 0.0f ?
         static_cast<int16_t>(gradient * grad_scale + 0.5) :
         static_cast<int16_t>(gradient * grad_scale - 0.5);
-      output_gradients_and_hessians_ptr[2 * index] = static_cast<int16_t>(hessian * hess_scale + 0.5);
+      output_gradients_and_hessians[2 * index] = static_cast<int16_t>(hessian * hess_scale + 0.5);
     }
   }
 }
@@ -144,6 +144,19 @@ void CUDAGradientDiscretizer::DiscretizeGradients(
     hess_max_block_buffer_.RawData());
     SynchronizeCUDADevice(__FILE__, __LINE__);
 
+  if (nccl_communicator_ != nullptr) {
+    SynchronizeCUDADevice(__FILE__, __LINE__);
+    cudaStream_t cuda_stream = CUDAStreamCreate();
+    NCCLGroupStart();
+    NCCLAllReduce<score_t>(grad_min_block_buffer_.RawDataReadOnly(), grad_min_block_buffer_.RawData(), 1, ncclFloat32, ncclMin, nccl_communicator_, cuda_stream);
+    NCCLAllReduce<score_t>(hess_min_block_buffer_.RawDataReadOnly(), hess_min_block_buffer_.RawData(), 1, ncclFloat32, ncclMin, nccl_communicator_, cuda_stream);
+    NCCLAllReduce<score_t>(grad_max_block_buffer_.RawDataReadOnly(), grad_max_block_buffer_.RawData(), 1, ncclFloat32, ncclMax, nccl_communicator_, cuda_stream);
+    NCCLAllReduce<score_t>(hess_max_block_buffer_.RawDataReadOnly(), hess_max_block_buffer_.RawData(), 1, ncclFloat32, ncclMax, nccl_communicator_, cuda_stream);
+    NCCLGroupEnd();
+    SynchronizeCUDAStream(cuda_stream, __FILE__, __LINE__);
+    CUDAStreamDestroy(cuda_stream);
+  }
+
   #define DiscretizeGradientsKernel_ARGS \
     num_data, \
     input_gradients, \
@@ -163,6 +176,17 @@ void CUDAGradientDiscretizer::DiscretizeGradients(
     DiscretizeGradientsKernel<false><<<num_reduce_blocks_, CUDA_GRADIENT_DISCRETIZER_BLOCK_SIZE>>>(DiscretizeGradientsKernel_ARGS);
   }
   SynchronizeCUDADevice(__FILE__, __LINE__);
+
+
+  std::vector<int16_t> host_discretized_gradients_and_hessians_;
+  host_discretized_gradients_and_hessians_.resize(2 * static_cast<size_t>(num_data));
+
+  CopyFromCUDADeviceToHost<int16_t>(host_discretized_gradients_and_hessians_.data(), discretized_gradients_and_hessians_.RawData(), 2 * static_cast<size_t>(num_data), __FILE__, __LINE__);
+
+  for (size_t i = 0; i < 100; ++i) {
+    Log::Warning("i = %ld, grad = %d, hess = %d", i, host_discretized_gradients_and_hessians_[2 * i], host_discretized_gradients_and_hessians_[2 * i + 1]);
+  }
+
   ++iter_;
 }
 

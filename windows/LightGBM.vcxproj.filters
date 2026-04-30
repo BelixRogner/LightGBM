@@ -278,6 +278,9 @@
     <ClCompile Include="..\src\objective\objective_function.cpp">
       <Filter>src\objective</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\objective\rank_objective.cpp">
+      <Filter>src\objective</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\Boosting\boosting.cpp">
       <Filter>src\boosting</Filter>
     </ClCompile>
@@ -359,8 +362,6 @@
     <ClCompile Include="..\src\treelearner\gradient_discretizer.cpp">
       <Filter>src\treelearner</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\utils\openmp_wrapper.cpp">
-      <Filter>src\utils</Filter>
-    </ClCompile>
+    <ClCompile Include="..\src\utils\openmp_wrapper.cpp" />
   </ItemGroup>
 </Project>

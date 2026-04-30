@@ -1,9 +1,11 @@
+cmake_minimum_required(VERSION 3.28)
+
 option(USE_MPI "Enable MPI-based distributed learning" OFF)
 option(USE_OPENMP "Enable OpenMP" ON)
 option(USE_GPU "Enable GPU-accelerated training" OFF)
 option(USE_SWIG "Enable SWIG to generate Java API" OFF)
 option(USE_TIMETAG "Set to ON to output time costs" OFF)
-option(USE_CUDA "Enable CUDA-accelerated training " OFF)
+option(USE_CUDA "Enable CUDA-accelerated training " ON)
 option(USE_ROCM "Enable ROCm-accelerated training " OFF)
 option(USE_DEBUG "Set to ON for Debug mode" OFF)
 option(USE_SANITIZER "Use sanitizer flags" OFF)
@@ -24,8 +26,6 @@ option(__BUILD_FOR_PYTHON "Set to ON if building lib_lightgbm for use with the P
 option(__BUILD_FOR_R "Set to ON if building lib_lightgbm for use with the R-package" OFF)
 option(__INTEGRATE_OPENCL "Set to ON if building LightGBM with the OpenCL ICD Loader and its dependencies included" OFF)
 
-cmake_minimum_required(VERSION 3.28)
-
 # If using Visual Studio generators, always target v10.x of the Windows SDK.
 # Doing this avoids lookups that could fall back to very old versions, e.g. by finding
 # outdated registry entries.
@@ -36,11 +36,7 @@ endif()
 
 project(lightgbm LANGUAGES C CXX)
 
-# if(BUILD_CPP_TEST)
-set(CMAKE_CXX_STANDARD 14)
-# else()
-#  set(CMAKE_CXX_STANDARD 11)
-# endif()
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/modules")
@@ -70,22 +66,19 @@ endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.8.2")
-    message(FATAL_ERROR "Insufficient gcc version")
+    message(FATAL_ERROR "Insufficient gcc version (${CMAKE_CXX_COMPILER_VERSION})")
   endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "3.8")
-    message(FATAL_ERROR "Insufficient Clang version")
+    message(FATAL_ERROR "Insufficient Clang version (${CMAKE_CXX_COMPILER_VERSION})")
   endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "8.1.0")
-    message(FATAL_ERROR "Insufficient AppleClang version")
+    message(FATAL_ERROR "Insufficient AppleClang version (${CMAKE_CXX_COMPILER_VERSION})")
   endif()
 elseif(MSVC)
   if(MSVC_VERSION LESS 1900)
-    message(
-      FATAL_ERROR
-      "The compiler ${CMAKE_CXX_COMPILER} doesn't support required C++11 features. Please use a newer MSVC."
-    )
+    message(FATAL_ERROR "Insufficient MSVC version (${MSVC_VERSION})")
   endif()
 endif()
 
@@ -224,6 +217,7 @@ endif()
 
 if(USE_CUDA)
     find_package(CUDAToolkit 11.0 REQUIRED)
+    find_package(NCCL REQUIRED)
     include_directories(${CUDAToolkit_INCLUDE_DIRS})
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=${OpenMP_CXX_FLAGS} -Xcompiler=-fPIC -Xcompiler=-Wall")
 
@@ -262,7 +256,7 @@ if(USE_CUDA)
     add_definitions(-DUSE_CUDA)
 
     if(NOT DEFINED CMAKE_CUDA_STANDARD)
-      set(CMAKE_CUDA_STANDARD 11)
+      set(CMAKE_CUDA_STANDARD 17)
       set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     endif()
 endif()
@@ -292,6 +286,9 @@ if(USE_ROCM)
     endif()
     message(STATUS "CMAKE_HIP_FLAGS: ${CMAKE_HIP_FLAGS}")
 
+    # Building for ROCm almost always means USE_CUDA.
+    # Exceptions to this will be guarded by USE_ROCM.
+    add_definitions(-DUSE_CUDA)
     add_definitions(-DUSE_ROCM)
 endif()
 
@@ -432,6 +429,7 @@ set(
       src/network/linkers_socket.cpp
       src/network/network.cpp
       src/objective/objective_function.cpp
+      src/objective/rank_objective.cpp
       src/treelearner/data_parallel_tree_learner.cpp
       src/treelearner/feature_histogram.cpp
       src/treelearner/feature_parallel_tree_learner.cpp
@@ -447,6 +445,7 @@ set(
     LGBM_CUDA_SOURCES
       src/boosting/cuda/cuda_score_updater.cpp
       src/boosting/cuda/cuda_score_updater.cu
+      src/boosting/cuda/nccl_gbdt.cpp
       src/metric/cuda/cuda_binary_metric.cpp
       src/metric/cuda/cuda_pointwise_metric.cpp
       src/metric/cuda/cuda_regression_metric.cpp
@@ -480,8 +479,19 @@ set(
       src/cuda/cuda_algorithms.cu
 )
 
-if(USE_CUDA)
+if(USE_CUDA OR USE_ROCM)
   list(APPEND LGBM_SOURCES ${LGBM_CUDA_SOURCES})
+endif()
+
+if(USE_ROCM)
+  set(CU_FILES "")
+  foreach(file IN LISTS LGBM_CUDA_SOURCES)
+      string(REGEX MATCH "\\.cu$" is_cu_file "${file}")
+      if(is_cu_file)
+          list(APPEND CU_FILES "${file}")
+      endif()
+  endforeach()
+  set_source_files_properties(${CU_FILES} PROPERTIES LANGUAGE HIP)
 endif()
 
 add_library(lightgbm_objs OBJECT ${LGBM_SOURCES})
@@ -597,6 +607,15 @@ if(USE_GPU)
   target_link_libraries(lightgbm_objs PUBLIC ${OpenCL_LIBRARY} ${Boost_LIBRARIES})
 endif()
 
+if(USE_CUDA)
+  target_link_libraries(lightgbm_objs PUBLIC ${NCCL_LIBRARY})
+endif()
+
+if(USE_ROCM)
+  find_package(rccl)
+  target_link_libraries(lightgbm_objs PUBLIC ${RCCL_LIBRARY})
+endif()
+
 if(__INTEGRATE_OPENCL)
   # targets OpenCL and Boost are added in IntegratedOpenCL.cmake
   add_dependencies(lightgbm_objs OpenCL Boost)
@@ -632,6 +651,10 @@ if(USE_CUDA)
   endif()
 endif()
 
+if(USE_ROCM)
+  target_link_libraries(lightgbm_objs PUBLIC hip::host)
+endif()
+
 if(WIN32)
     if(MINGW OR CYGWIN)
       target_link_libraries(lightgbm_objs PUBLIC ws2_32 iphlpapi)
@@ -656,12 +679,16 @@ if(BUILD_CPP_TEST)
   if(NOT GTEST_FOUND)
     message(STATUS "Did not find Google Test in the system root. Fetching Google Test now...")
     include(FetchContent)
+# lint_cmake: -readability/wonkycase
     FetchContent_Declare(
+# lint_cmake: +readability/wonkycase
       googletest
       GIT_REPOSITORY https://github.com/google/googletest.git
       GIT_TAG        v1.14.0
     )
+# lint_cmake: -readability/wonkycase
     FetchContent_MakeAvailable(googletest)
+# lint_cmake: +readability/wonkycase
     add_library(GTest::GTest ALIAS gtest)
   endif()
 
@@ -802,7 +829,7 @@ if(APPLE AND USE_OPENMP AND NOT BUILD_STATIC_LIB)
       # ensure that R's library directory is the first place the loader searches for
       # libomp.dylib when clang is used.
       #
-      # ref: https://github.com/microsoft/LightGBM/issues/6628
+      # ref: https://github.com/lightgbm-org/LightGBM/issues/6628
       #
       if(__BUILD_FOR_R)
         list(PREPEND __omp_install_rpaths "${LIBR_LIBS_DIR}")

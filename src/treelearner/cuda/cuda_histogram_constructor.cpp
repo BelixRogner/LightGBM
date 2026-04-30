@@ -1,5 +1,6 @@
 /*!
- * Copyright (c) 2021 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2021-2026 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2021-2026 The LightGBM developers. All rights reserved.
  * Licensed under the MIT License. See LICENSE file in the project root for
  * license information.
  */
@@ -9,6 +10,7 @@
 #include "cuda_histogram_constructor.hpp"
 
 #include <algorithm>
+#include <vector>
 
 namespace LightGBM {
 
@@ -107,8 +109,8 @@ void CUDAHistogramConstructor::Init(const Dataset* train_data, TrainingShareStat
         cuda_hist_buffer_.Resize(buffer_size * 2);
       }
     } else {
-      // use only half the size of histogram buffer in global memory when quantized training since each gradient and hessian takes only 2 bytes
-      cuda_hist_buffer_.Resize(buffer_size);
+      // use only half the size of histogram buffer in global memory when quantized training since each gradient and hessian takes only 2 or 4 bytes
+      cuda_hist_buffer_.Resize(buffer_size * 2);
     }
   }
   hist_buffer_for_num_bit_change_.Resize(num_total_bin_ * 2);
@@ -117,16 +119,45 @@ void CUDAHistogramConstructor::Init(const Dataset* train_data, TrainingShareStat
 void CUDAHistogramConstructor::ConstructHistogramForLeaf(
   const CUDALeafSplitsStruct* cuda_smaller_leaf_splits,
   const CUDALeafSplitsStruct* /*cuda_larger_leaf_splits*/,
+  const data_size_t global_num_data_in_smaller_leaf,
+  const data_size_t global_num_data_in_larger_leaf,
   const data_size_t num_data_in_smaller_leaf,
-  const data_size_t num_data_in_larger_leaf,
+  const data_size_t /*num_data_in_larger_leaf*/,
   const double sum_hessians_in_smaller_leaf,
   const double sum_hessians_in_larger_leaf,
   const uint8_t num_bits_in_histogram_bins) {
-  if ((num_data_in_smaller_leaf <= min_data_in_leaf_ || sum_hessians_in_smaller_leaf <= min_sum_hessian_in_leaf_) &&
-    (num_data_in_larger_leaf <= min_data_in_leaf_ || sum_hessians_in_larger_leaf <= min_sum_hessian_in_leaf_)) {
+if ((global_num_data_in_smaller_leaf <= min_data_in_leaf_ || sum_hessians_in_smaller_leaf <= min_sum_hessian_in_leaf_) &&
+    (global_num_data_in_larger_leaf <= min_data_in_leaf_ || sum_hessians_in_larger_leaf <= min_sum_hessian_in_leaf_)) {
     return;
   }
   LaunchConstructHistogramKernel(cuda_smaller_leaf_splits, num_data_in_smaller_leaf, num_bits_in_histogram_bins);
+
+  // CUDALeafSplitsStruct host_smaller_leaf_splits;
+  // CopyFromCUDADeviceToHost<CUDALeafSplitsStruct>(&host_smaller_leaf_splits, cuda_smaller_leaf_splits, sizeof(CUDALeafSplitsStruct), __FILE__, __LINE__);
+  if (num_bits_in_histogram_bins <= 16) {
+    std::vector<int32_t> host_smaller_leaf_splits_hist(static_cast<size_t>(num_total_bin_));
+    CopyFromCUDADeviceToHost<int32_t>(host_smaller_leaf_splits_hist.data(),
+                            reinterpret_cast<const int32_t*>(cuda_hist_.RawData()),
+                            static_cast<size_t>(num_total_bin_), __FILE__, __LINE__);
+    for (int i = 0; i < 100; ++i) {
+      int32_t grad_and_hess = host_smaller_leaf_splits_hist[i];
+      int16_t grad = (grad_and_hess & 0xffff0000) >> 16;
+      uint16_t hess = static_cast<uint16_t>(grad_and_hess & 0x0000ffff);
+      Log::Warning("i = %d, grad = %d, hess = %d", i, grad, hess);
+    }
+  } else {
+    std::vector<int64_t> host_smaller_leaf_splits_hist(static_cast<size_t>(num_total_bin_));
+    CopyFromCUDADeviceToHost<int64_t>(host_smaller_leaf_splits_hist.data(),
+                           reinterpret_cast<const int64_t*>(cuda_hist_.RawData()),
+                            static_cast<size_t>(num_total_bin_), __FILE__, __LINE__);
+    for (int i = 0; i < 100; ++i) {
+      int64_t grad_and_hess = host_smaller_leaf_splits_hist[i];
+      int32_t grad = (grad_and_hess & 0xffffffff00000000) >> 32;
+      uint32_t hess = static_cast<uint32_t>(grad_and_hess & 0x00000000ffffffff);
+      Log::Warning("i = %d, grad = %d, hess = %d", i, grad, hess);
+    }
+  }
+
   SynchronizeCUDADevice(__FILE__, __LINE__);
 }
 

@@ -1,5 +1,6 @@
 /*!
- * Copyright (c) 2016 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2016-2026 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2016-2026 The LightGBM developers. All rights reserved.
  * Licensed under the MIT License. See LICENSE file in the project root for license information.
  */
 #include "serial_tree_learner.h"
@@ -10,10 +11,13 @@
 #include <LightGBM/utils/common.h>
 
 #include <algorithm>
+#include <memory>
 #include <queue>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "cost_effective_gradient_boosting.hpp"
 
@@ -312,6 +316,10 @@ void SerialTreeLearner::BeforeTrain() {
         gradient_discretizer_->discretized_gradients_and_hessians(),
         gradient_discretizer_->grad_scale(),
         gradient_discretizer_->hess_scale());
+      Log::Warning("sum_gradients = %f, sum_hessians = %f", smaller_leaf_splits_->sum_gradients(), smaller_leaf_splits_->sum_hessians());
+      int64_t int_sum_gradients_and_hessians = smaller_leaf_splits_->int_sum_gradients_and_hessians();
+      Log::Warning("int_sum_gradient = %d", (int_sum_gradients_and_hessians & 0xffffffff00000000) >> 32);
+      Log::Warning("int_sum_hessian = %d", int_sum_gradients_and_hessians & 0x00000000ffffffff);
     }
   } else {
     // use bagging, only use part of data
@@ -370,12 +378,16 @@ bool SerialTreeLearner::BeforeFindBestSplit(const Tree* tree, int left_leaf, int
     larger_leaf_histogram_array_ = nullptr;
   } else if (num_data_in_left_child < num_data_in_right_child) {
     // put parent(left) leaf's histograms into larger leaf's histograms
-    if (histogram_pool_.Get(left_leaf, &larger_leaf_histogram_array_)) { parent_leaf_histogram_array_ = larger_leaf_histogram_array_; }
+    if (histogram_pool_.Get(left_leaf, &larger_leaf_histogram_array_)) {
+      parent_leaf_histogram_array_ = larger_leaf_histogram_array_;
+    }
     histogram_pool_.Move(left_leaf, right_leaf);
     histogram_pool_.Get(left_leaf, &smaller_leaf_histogram_array_);
   } else {
     // put parent(left) leaf's histograms to larger leaf's histograms
-    if (histogram_pool_.Get(left_leaf, &larger_leaf_histogram_array_)) { parent_leaf_histogram_array_ = larger_leaf_histogram_array_; }
+    if (histogram_pool_.Get(left_leaf, &larger_leaf_histogram_array_)) {
+      parent_leaf_histogram_array_ = larger_leaf_histogram_array_;
+    }
     histogram_pool_.Get(right_leaf, &smaller_leaf_histogram_array_);
   }
   return true;
@@ -428,6 +440,25 @@ void SerialTreeLearner::ConstructHistograms(
     } else {
       train_data_->ConstructHistograms<true, 32>(SMALLER_LEAF_ARGS);
     }
+
+    if (smaller_leaf_num_bits <= 16) {
+      const int32_t* ptr_smaller_leaf_hist_data_int32_t = reinterpret_cast<const int32_t*>(ptr_smaller_leaf_hist_data);
+      for (int i = 0; i < 100; ++i) {
+        const int32_t grad_and_hess = ptr_smaller_leaf_hist_data_int32_t[i];
+        const int16_t grad = (grad_and_hess & 0xffff0000) >> 16;
+        const uint16_t hess = static_cast<uint16_t>(grad_and_hess & 0x0000ffff);
+        Log::Warning("i = %d, grad = %d, hess = %d", i, grad, hess);
+      }
+    } else {
+      const int64_t* ptr_smaller_leaf_hist_data_int64_t = reinterpret_cast<const int64_t*>(ptr_smaller_leaf_hist_data);
+      for (int i = 0; i < 100; ++i) {
+        const int64_t grad_and_hess = ptr_smaller_leaf_hist_data_int64_t[i];
+        const int32_t grad = (grad_and_hess & 0xffffffff00000000) >> 32;
+        const uint32_t hess = static_cast<uint32_t>(grad_and_hess & 0x00000000ffffffff);
+        Log::Warning("i = %d, grad = %d, hess = %d", i, grad, hess);
+      }
+    }
+
     #undef SMALLER_LEAF_ARGS
     if (larger_leaf_histogram_array_ && !use_subtract) {
       const uint8_t larger_leaf_num_bits = gradient_discretizer_->GetHistBitsInLeaf<false>(larger_leaf_splits_->leaf_index());

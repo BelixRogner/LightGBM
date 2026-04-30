@@ -1,11 +1,12 @@
 /*!
- * Copyright (c) 2021 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2021-2026 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2021-2026 The LightGBM developers. All rights reserved.
  * Licensed under the MIT License. See LICENSE file in the project root for
  * license information.
  */
 
-#ifndef LIGHTGBM_TREELEARNER_CUDA_CUDA_GRADIENT_DISCRETIZER_HPP_
-#define LIGHTGBM_TREELEARNER_CUDA_CUDA_GRADIENT_DISCRETIZER_HPP_
+#ifndef LIGHTGBM_SRC_TREELEARNER_CUDA_CUDA_GRADIENT_DISCRETIZER_HPP_
+#define LIGHTGBM_SRC_TREELEARNER_CUDA_CUDA_GRADIENT_DISCRETIZER_HPP_
 
 #ifdef USE_CUDA
 
@@ -25,18 +26,20 @@ namespace LightGBM {
 
 #define CUDA_GRADIENT_DISCRETIZER_BLOCK_SIZE (1024)
 
-class CUDAGradientDiscretizer: public GradientDiscretizer {
+class CUDAGradientDiscretizer: public GradientDiscretizer, public NCCLInfo {
  public:
   CUDAGradientDiscretizer(int num_grad_quant_bins, int num_trees, int random_seed, bool is_constant_hessian, bool stochastic_roudning):
     GradientDiscretizer(num_grad_quant_bins, num_trees, random_seed, is_constant_hessian, stochastic_roudning) {
   }
+
+  ~CUDAGradientDiscretizer() {}
 
   void DiscretizeGradients(
     const data_size_t num_data,
     const score_t* input_gradients,
     const score_t* input_hessians) override;
 
-  const int8_t* discretized_gradients_and_hessians() const override { return discretized_gradients_and_hessians_.RawData(); }
+  const int8_t* discretized_gradients_and_hessians() const override { return reinterpret_cast<const int8_t*>( discretized_gradients_and_hessians_.RawData()); }
 
   double grad_scale() const override {
     Log::Fatal("grad_scale() of CUDAGradientDiscretizer should not be called.");
@@ -101,7 +104,7 @@ class CUDAGradientDiscretizer: public GradientDiscretizer {
   }
 
  protected:
-  mutable CUDAVector<int8_t> discretized_gradients_and_hessians_;
+  mutable CUDAVector<int16_t> discretized_gradients_and_hessians_;
   mutable CUDAVector<score_t> grad_min_block_buffer_;
   mutable CUDAVector<score_t> grad_max_block_buffer_;
   mutable CUDAVector<score_t> hess_min_block_buffer_;
@@ -115,4 +118,4 @@ class CUDAGradientDiscretizer: public GradientDiscretizer {
 }  // namespace LightGBM
 
 #endif  // USE_CUDA
-#endif  // LIGHTGBM_TREELEARNER_CUDA_CUDA_GRADIENT_DISCRETIZER_HPP_
+#endif  // LIGHTGBM_SRC_TREELEARNER_CUDA_CUDA_GRADIENT_DISCRETIZER_HPP_

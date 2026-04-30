@@ -1,5 +1,6 @@
 /*!
- * Copyright (c) 2022 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2022-2026 Microsoft Corporation. All rights reserved.
+ * Copyright (c) 2022-2026 The LightGBM developers. All rights reserved.
  * Licensed under the MIT License. See LICENSE file in the project root for
  * license information.
  */
@@ -157,6 +158,10 @@ void GradientDiscretizer::DiscretizeGradients(
         discretized_int8[2 * i] = static_cast<int8_t>(input_hessians[i] * inverse_hessian_scale_ + 0.5);
       }
     }
+  }
+
+  for (size_t i = 0; i < 100; ++i) {
+    Log::Warning("i = %ld, grad = %d, hess = %d", i, discretized_int8[2 * i + 1], discretized_int8[2 * i]);
   }
 }
 
