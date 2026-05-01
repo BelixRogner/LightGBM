@@ -140,6 +140,8 @@ Optuna (hyperparameter optimization framework): https://github.com/optuna/optuna
 
 LightGBMLSS (probabilistic modelling with LightGBM): https://github.com/StatMixedML/LightGBMLSS
 
+LightGBM-MoE (Mixture-of-Experts / regime-switching extension): https://github.com/kyo219/LightGBM-MoE
+
 mlforecast (time series forecasting with LightGBM): https://github.com/Nixtla/mlforecast
 
 skforecast (time series forecasting with LightGBM): https://github.com/JoaquinAmatRodrigo/skforecast
