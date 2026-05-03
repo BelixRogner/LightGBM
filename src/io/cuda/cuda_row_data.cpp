@@ -53,6 +53,9 @@ gpu_use_dp_(gpu_use_dp) {
 }
 
 CUDARowData::~CUDARowData() {
+  if (cuda_data_is_host_mapped_) {
+    cuda_data_uint8_t_ = nullptr;  // not owned by us; freed by host vec destructor
+  }
   DeallocateCUDAMemory<uint8_t>(&cuda_data_uint8_t_, __FILE__, __LINE__);
   DeallocateCUDAMemory<uint16_t>(&cuda_data_uint16_t_, __FILE__, __LINE__);
   DeallocateCUDAMemory<uint32_t>(&cuda_data_uint32_t_, __FILE__, __LINE__);
@@ -79,9 +82,49 @@ void CUDARowData::Init(const Dataset* train_data, TrainingShareStates* train_sha
   const void* host_data = train_share_state->GetRowWiseData(&bit_type_, &total_size, &is_sparse_, &host_row_ptr, &row_ptr_bit_type_);
   if (bit_type_ == 8) {
     if (!is_sparse_) {
-      std::vector<uint8_t> partitioned_data;
-      GetDenseDataPartitioned<uint8_t>(reinterpret_cast<const uint8_t*>(host_data), &partitioned_data);
-      InitCUDAMemoryFromHostMemory<uint8_t>(&cuda_data_uint8_t_, partitioned_data.data(), total_size, __FILE__, __LINE__);
+      // Allocate the bin matrix on GPU. On large datasets (≥17 GB) we rely on
+      // CUDAColumnData being skipped (its 17 GB per-column buffers are not needed
+      // when CompactColumnData provides per-tree compact column data instead) —
+      // see cuda_column_data.cpp Init.
+      host_partitioned_data_uint8_t_.resize(total_size);
+      GetDenseDataPartitionedToBuffer<uint8_t>(reinterpret_cast<const uint8_t*>(host_data), host_partitioned_data_uint8_t_.data());
+      cudaError_t alloc_err = cudaMalloc(reinterpret_cast<void**>(&cuda_data_uint8_t_), total_size);
+      if (alloc_err == cudaSuccess) {
+        gpuAssert(cudaMemcpy(cuda_data_uint8_t_, host_partitioned_data_uint8_t_.data(), total_size, cudaMemcpyHostToDevice), __FILE__, __LINE__);
+        std::vector<uint8_t>().swap(host_partitioned_data_uint8_t_);
+        Log::Info("CUDARowData: bin matrix on GPU (%.2f GB)", total_size / 1e9);
+      } else {
+        cudaGetLastError();  // clear OOM
+        // Transpose to column-major for fast per-column cudaMemcpy.
+        // Layout: column c (global, in partition order) starts at byte (col_offset[c]) * num_data,
+        // contiguous num_data bytes. Then we no longer need the row-major partitioned buffer.
+        const int num_total_columns = feature_partition_column_index_offsets_.back();
+        std::vector<uint8_t> col_major(static_cast<size_t>(num_total_columns) * static_cast<size_t>(num_data_));
+        // Per partition, transpose row-major-in-partition → column-major (each col = num_data contiguous bytes).
+        const size_t num_partitions = feature_partition_column_index_offsets_.size() - 1;
+        for (size_t p = 0; p < num_partitions; ++p) {
+          const int p_start = feature_partition_column_index_offsets_[p];
+          const int p_end = feature_partition_column_index_offsets_[p + 1];
+          const int p_num = p_end - p_start;
+          const size_t p_byte = static_cast<size_t>(p_start) * static_cast<size_t>(num_data_);
+          const uint8_t* src_p = host_partitioned_data_uint8_t_.data() + p_byte;
+          uint8_t* dst_p = col_major.data() + p_byte;
+          // src_p is row-major-in-partition; dst_p is column-major (col contiguous in dst, stride 1 per row).
+          // For each col_in_p c: dst_p[c * num_data + r] = src_p[r * p_num + c]
+          #pragma omp parallel for num_threads(num_threads_) schedule(static)
+          for (int c = 0; c < p_num; ++c) {
+            uint8_t* dst_col = dst_p + static_cast<size_t>(c) * static_cast<size_t>(num_data_);
+            const uint8_t* src_col_start = src_p + c;
+            for (data_size_t r = 0; r < num_data_; ++r) {
+              dst_col[r] = src_col_start[static_cast<size_t>(r) * static_cast<size_t>(p_num)];
+            }
+          }
+        }
+        host_partitioned_data_uint8_t_.swap(col_major);
+        cuda_data_is_host_mapped_ = true;
+        cuda_data_uint8_t_ = nullptr;
+        Log::Warning("CUDARowData: bin matrix too large for GPU (%.2f GB), transposed to column-major host layout. Compact view will cudaMemcpy sampled cols directly.", total_size / 1e9);
+      }
     } else {
       if (row_ptr_bit_type_ == 16) {
         InitSparseData<uint8_t, uint16_t>(
@@ -224,7 +267,9 @@ void CUDARowData::DivideCUDAFeatureGroups(const Dataset* train_data, TrainingSha
 
       // try if adding this column exceed the maximum number per partition
       const uint32_t cur_hist_num_bin = column_feature_hist_end - start_hist_offset;
-      if (cur_hist_num_bin > max_num_bin_per_partition) {
+      const int cur_partition_columns = column_index - feature_partition_column_index_offsets_.back();
+      if (cur_hist_num_bin > max_num_bin_per_partition ||
+          cur_partition_columns >= 504) {  // half of NUM_THREADS_PER_BLOCK to enable block_dim_y=2
         feature_partition_column_index_offsets_.emplace_back(column_index);
         start_hist_offset = column_feature_hist_start;
         partition_hist_offsets_.emplace_back(start_hist_offset);
@@ -262,7 +307,9 @@ void CUDARowData::DivideCUDAFeatureGroups(const Dataset* train_data, TrainingSha
 
         // try if adding this column exceed the maximum number per partition
         const uint32_t cur_hist_num_bin = column_feature_hist_end - start_hist_offset;
-        if (cur_hist_num_bin > max_num_bin_per_partition) {
+        const int cur_partition_columns = column_index - feature_partition_column_index_offsets_.back();
+        if (cur_hist_num_bin > max_num_bin_per_partition ||
+            cur_partition_columns >= 504) {  // half of NUM_THREADS_PER_BLOCK to enable block_dim_y=2
           feature_partition_column_index_offsets_.emplace_back(column_index);
           start_hist_offset = column_feature_hist_start;
           partition_hist_offsets_.emplace_back(start_hist_offset);
@@ -289,6 +336,9 @@ void CUDARowData::DivideCUDAFeatureGroups(const Dataset* train_data, TrainingSha
       max_num_column_per_partition_ = num_column;
     }
   }
+  if (max_num_column_per_partition_ == 0) {
+    max_num_column_per_partition_ = 1;
+  }
 
   InitCUDAMemoryFromHostMemory<int>(&cuda_feature_partition_column_index_offsets_,
     feature_partition_column_index_offsets_.data(),
@@ -307,6 +357,30 @@ void CUDARowData::DivideCUDAFeatureGroups(const Dataset* train_data, TrainingSha
     partition_hist_offsets_.size(),
     __FILE__,
     __LINE__);
+}
+
+template <typename BIN_TYPE>
+void CUDARowData::GetDenseDataPartitionedToBuffer(const BIN_TYPE* row_wise_data, BIN_TYPE* out_data) {
+  const int num_total_columns = feature_partition_column_index_offsets_.back();
+  Threading::For<data_size_t>(0, num_data_, 512,
+    [this, num_total_columns, row_wise_data, out_data] (int /*thread_index*/, data_size_t start, data_size_t end) {
+      for (size_t i = 0; i < feature_partition_column_index_offsets_.size() - 1; ++i) {
+        const int num_prev_columns = static_cast<int>(feature_partition_column_index_offsets_[i]);
+        const size_t offset = static_cast<size_t>(num_data_) * static_cast<size_t>(num_prev_columns);
+        const int partition_column_start = feature_partition_column_index_offsets_[i];
+        const int partition_column_end = feature_partition_column_index_offsets_[i + 1];
+        const int num_columns_in_cur_partition = partition_column_end - partition_column_start;
+        for (data_size_t data_index = start; data_index < end; ++data_index) {
+          const size_t data_offset = offset + static_cast<size_t>(data_index) * num_columns_in_cur_partition;
+          const size_t read_data_offset = static_cast<size_t>(data_index) * num_total_columns;
+          for (int column_index = 0; column_index < num_columns_in_cur_partition; ++column_index) {
+            const size_t true_column_index = read_data_offset + column_index + partition_column_start;
+            const BIN_TYPE bin = row_wise_data[true_column_index];
+            out_data[data_offset + column_index] = bin;
+          }
+        }
+      }
+    });
 }
 
 template <typename BIN_TYPE>
@@ -391,6 +465,9 @@ void CUDARowData::GetSparseDataPartitioned(
     if (thread_max_elements_per_row[thread_index] > max_num_column_per_partition_) {
       max_num_column_per_partition_ = thread_max_elements_per_row[thread_index];
     }
+  }
+  if (max_num_column_per_partition_ == 0) {
+    max_num_column_per_partition_ = 1;
   }
 }
 

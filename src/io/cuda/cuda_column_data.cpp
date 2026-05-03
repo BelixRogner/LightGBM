@@ -35,8 +35,17 @@ CUDAColumnData::CUDAColumnData(const data_size_t num_data, const int gpu_device_
 CUDAColumnData::~CUDAColumnData() {
   DeallocateCUDAMemory<data_size_t>(&cuda_used_indices_, __FILE__, __LINE__);
   DeallocateCUDAMemory<void*>(&cuda_data_by_column_, __FILE__, __LINE__);
-  for (size_t i = 0; i < data_by_column_.size(); ++i) {
-    DeallocateCUDAMemory<void>(&data_by_column_[i], __FILE__, __LINE__);
+  // Free per-column allocations. If a compact view was set, data_by_column_
+  // currently holds offsets into someone-else's buffer (NOT ours to free) —
+  // free the snapshot in data_by_column_orig_ instead. If no compact view was
+  // ever set, data_by_column_orig_ is empty and we free data_by_column_ directly.
+  // If init_skipped_per_column_alloc_ was true, no per-column alloc happened
+  // and both vectors are nullptr-only — skip the loop.
+  if (!init_skipped_per_column_alloc_) {
+    std::vector<void*>& to_free = data_by_column_orig_.empty() ? data_by_column_ : data_by_column_orig_;
+    for (size_t i = 0; i < to_free.size(); ++i) {
+      DeallocateCUDAMemory<void>(&to_free[i], __FILE__, __LINE__);
+    }
   }
   DeallocateCUDAMemory<uint8_t>(&cuda_column_bit_type_, __FILE__, __LINE__);
   DeallocateCUDAMemory<uint32_t>(&cuda_feature_min_bin_, __FILE__, __LINE__);
@@ -115,6 +124,21 @@ void CUDAColumnData::Init(const int num_columns,
   feature_mfb_is_zero_ = feature_mfb_is_zero;
   feature_mfb_is_na_ = feature_mfb_is_na;
   data_by_column_.resize(num_columns_, nullptr);
+  // Decide whether to skip the per-column GPU allocation. With a 32 GB GPU and
+  // a 17 GB row matrix on top, we can't afford another 17 GB of per-column data.
+  // Skip when total size would exceed 8 GB; the caller (tree learner) will provide
+  // a compact column view per tree via SetCompactColumnView.
+  size_t expected_total_bytes = 0;
+  for (int c = 0; c < num_columns_; ++c) {
+    const int8_t bt = column_bit_type[c];
+    int bytes_per = (bt == 4 || bt == 8) ? 1 : (bt == 16 ? 2 : 4);
+    expected_total_bytes += static_cast<size_t>(num_data_) * bytes_per;
+  }
+  init_skipped_per_column_alloc_ = (expected_total_bytes > (size_t)8 * 1024 * 1024 * 1024);
+  if (init_skipped_per_column_alloc_) {
+    Log::Warning("CUDAColumnData: skipping per-column allocation (would be %.2f GB). "
+                 "Caller must invoke SetCompactColumnView per tree.", expected_total_bytes / 1e9);
+  }
   OMP_INIT_EX();
   #pragma omp parallel num_threads(num_threads_)
   {
@@ -125,7 +149,13 @@ void CUDAColumnData::Init(const int num_columns,
       const int8_t bit_type = column_bit_type[column_index];
       if (column_data[column_index] != nullptr) {
         // is dense column
-        if (bit_type == 4) {
+        if (init_skipped_per_column_alloc_) {
+          // Adjust column_bit_type_ for 4-bit case (which expanded to 8) and skip GPU alloc.
+          if (bit_type == 4) {
+            column_bit_type_[column_index] = 8;
+          }
+          data_by_column_[column_index] = nullptr;
+        } else if (bit_type == 4) {
           column_bit_type_[column_index] = 8;
           InitOneColumnData<false, true, uint8_t>(column_data[column_index], nullptr, &data_by_column_[column_index]);
         } else if (bit_type == 8) {
@@ -221,6 +251,36 @@ void CUDAColumnData::CopySubrow(
   CopyFromHostToCUDADevice<data_size_t>(cuda_used_indices_, used_indices, static_cast<size_t>(num_used_indices), __FILE__, __LINE__);
   num_used_indices_ = num_used_indices;
   LaunchCopySubrowKernel(full_set->cuda_data_by_column());
+}
+
+void CUDAColumnData::SetCompactColumnView(const std::vector<int>& column_to_compact_slot,
+                                          void* compact_buf,
+                                          size_t bytes_per_col) {
+  // Snapshot original pointers on first compact-view call so we can both
+  // restore on demand and free them in the destructor (the compact-buf offsets
+  // we write into data_by_column_ are NOT owned by us).
+  if (data_by_column_orig_.empty() && !data_by_column_.empty()) {
+    data_by_column_orig_ = data_by_column_;
+  }
+  for (int c = 0; c < num_columns_; ++c) {
+    if (c < static_cast<int>(column_to_compact_slot.size()) && column_to_compact_slot[c] >= 0) {
+      const size_t off = static_cast<size_t>(column_to_compact_slot[c]) * bytes_per_col;
+      data_by_column_[c] = reinterpret_cast<uint8_t*>(compact_buf) + off;
+    } else {
+      data_by_column_[c] = nullptr;
+    }
+  }
+  if (cuda_data_by_column_ == nullptr) {
+    InitCUDAMemoryFromHostMemory<void*>(&cuda_data_by_column_, data_by_column_.data(), data_by_column_.size(), __FILE__, __LINE__);
+  } else {
+    CopyFromHostToCUDADevice<void*>(cuda_data_by_column_, data_by_column_.data(), data_by_column_.size(), __FILE__, __LINE__);
+  }
+}
+
+void CUDAColumnData::RestoreOriginalColumnView() {
+  if (data_by_column_orig_.empty()) return;
+  data_by_column_ = data_by_column_orig_;
+  CopyFromHostToCUDADevice<void*>(cuda_data_by_column_, data_by_column_.data(), data_by_column_.size(), __FILE__, __LINE__);
 }
 
 void CUDAColumnData::ResizeWhenCopySubrow(const data_size_t num_used_indices) {

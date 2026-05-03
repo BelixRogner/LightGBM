@@ -78,6 +78,22 @@ class CUDASingleGPUTreeLearner: public SerialTreeLearner {
 
   void LaunchCalcLeafValuesGivenGradStat(CUDATree* cuda_tree, const data_size_t* num_data_in_leaf);
 
+  // Per-tree compact column data: transposes the on-GPU row-major bin matrix into
+  // a column-major buffer for partition kernels, avoiding the 17 GB per-column
+  // allocation in CUDAColumnData.
+  void BuildCompactColumnView();
+  CUDAVector<uint8_t> compact_column_buffer_;
+  std::vector<int> compact_column_to_orig_;        // [slot] -> original column index
+  std::vector<int> orig_column_to_compact_slot_;   // [col] -> slot, or -1
+  CUDAVector<int> cuda_compact_slot_for_col_;      // GPU copy of orig_column_to_compact_slot_
+  CUDAVector<int> cuda_src_part_col_offsets_;
+  CUDAVector<int> cuda_src_part_stride_;
+  // Per-slot precomputed metadata for the new (slot, row)-launched transpose:
+  CUDAVector<size_t> cuda_slot_p_byte_;
+  CUDAVector<int> cuda_slot_p_stride_;
+  CUDAVector<int> cuda_slot_col_in_p_;
+  uint64_t compact_col_signature_ = 0;
+
   // GPU device ID
   int gpu_device_id_;
   // number of threads on CPU

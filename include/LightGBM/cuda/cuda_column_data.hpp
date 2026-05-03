@@ -89,6 +89,24 @@ class CUDAColumnData {
 
   uint8_t column_bit_type(const int column_index) const { return column_bit_type_[column_index]; }
 
+  // ===== Per-tree compact column view =====
+  // Set a compact column buffer for sampled features. Updates data_by_column_[c]
+  // pointers for sampled features to point into compact_buf at strided offsets;
+  // re-uploads cuda_data_by_column_. Non-sampled features get nullptr.
+  // Compact layout: compact_buf[slot * num_data + r]; slot = compact index assigned
+  // by the caller via column_to_compact_slot[c] (-1 if not in sample).
+  void SetCompactColumnView(const std::vector<int>& column_to_compact_slot,
+                            void* compact_buf,
+                            size_t bytes_per_col);
+
+  // Restore data_by_column_ to point to the original per-column allocations.
+  // Needed when feature_fraction = 1.0 / no compaction (rare path).
+  void RestoreOriginalColumnView();
+
+  // Skip per-column allocation in Init? Used when caller will provide compact view.
+  bool init_skipped_per_column_alloc_ = false;
+  std::vector<void*> data_by_column_orig_;  // backup of original pointers
+
  private:
   template <bool IS_SPARSE, bool IS_4BIT, typename BIN_TYPE>
   void InitOneColumnData(const void* in_column_data, BinIterator* bin_iterator, void** out_column_data_pointer);

@@ -50,8 +50,6 @@ CUDATree::~CUDATree() {
   DeallocateCUDAMemory<double>(&cuda_leaf_weight_, __FILE__, __LINE__);
   DeallocateCUDAMemory<data_size_t>(&cuda_internal_count_, __FILE__, __LINE__);
   DeallocateCUDAMemory<float>(&cuda_split_gain_, __FILE__, __LINE__);
-  // ToHost() may have already destroyed the stream — guard against
-  // double-destroy.
   if (cuda_stream_ != nullptr) {
     gpuAssert(cudaStreamDestroy(cuda_stream_), __FILE__, __LINE__);
   }
@@ -323,16 +321,67 @@ void CUDATree::ToHost() {
     cat_threshold_inner_ = cuda_bitset_inner_.ToHost();
   }
 
+  // Shrink host vectors to actual size before they're kept long-term in the
+  // Booster's model list. With max_leaves_=8192 but actual num_leaves_~125 on
+  // Numerai prod, this drops per-tree CPU memory from ~650 KB to ~10 KB.
+  if (num_leaves_ > 0 && num_leaves_ < max_leaves_) {
+    const size_t n_internal = static_cast<size_t>(num_leaves_) - 1;
+    const size_t n_leaves = static_cast<size_t>(num_leaves_);
+    left_child_.resize(n_internal); left_child_.shrink_to_fit();
+    right_child_.resize(n_internal); right_child_.shrink_to_fit();
+    split_feature_inner_.resize(n_internal); split_feature_inner_.shrink_to_fit();
+    split_feature_.resize(n_internal); split_feature_.shrink_to_fit();
+    threshold_in_bin_.resize(n_internal); threshold_in_bin_.shrink_to_fit();
+    threshold_.resize(n_internal); threshold_.shrink_to_fit();
+    decision_type_.resize(n_internal); decision_type_.shrink_to_fit();
+    split_gain_.resize(n_internal); split_gain_.shrink_to_fit();
+    leaf_parent_.resize(n_internal); leaf_parent_.shrink_to_fit();
+    internal_value_.resize(n_internal); internal_value_.shrink_to_fit();
+    internal_weight_.resize(n_internal); internal_weight_.shrink_to_fit();
+    internal_count_.resize(n_internal); internal_count_.shrink_to_fit();
+    leaf_value_.resize(n_leaves); leaf_value_.shrink_to_fit();
+    leaf_weight_.resize(n_leaves); leaf_weight_.shrink_to_fit();
+    leaf_count_.resize(n_leaves); leaf_count_.shrink_to_fit();
+    leaf_depth_.resize(n_leaves); leaf_depth_.shrink_to_fit();
+  }
+
   SynchronizeCUDADevice(__FILE__, __LINE__);
 
-  // Destroy the per-tree CUDA stream now that the tree is finalized on the
-  // host. cuda_stream_ is only used by SplitKernel/SplitCategoricalKernel
-  // during tree construction, never post-ToHost. Without this, every Tree
-  // kept in the booster's models_ list holds an additional live stream until
-  // booster destruction, growing CUDA driver scheduling overhead linearly
-  // with num_trees and producing observable per-iteration TPS decay.
+  // Free per-tree GPU buffers we no longer need after ToHost copies them to CPU
+  // vectors. Without this, accumulated per-tree GPU memory OOMs the 32GB device
+  // after ~6k trees on the Numerai prod config (60k×125-leaf).
+  // Shrink cuda_leaf_value_ from max_leaves_ down to actual num_leaves_ — it's
+  // the only field GBDT::UpdateScore needs for the post-train AddPredictionToScore.
+  // For prod (max=8192, actual ~125), this drops per-tree GPU keep from 64KB → 1KB.
+  if (num_leaves_ > 0 && num_leaves_ < max_leaves_ && cuda_leaf_value_ != nullptr) {
+    double* shrunk = nullptr;
+    AllocateCUDAMemory<double>(&shrunk, static_cast<size_t>(num_leaves_), __FILE__, __LINE__);
+    CopyFromCUDADeviceToCUDADevice<double>(shrunk, cuda_leaf_value_, static_cast<size_t>(num_leaves_), __FILE__, __LINE__);
+    DeallocateCUDAMemory<double>(&cuda_leaf_value_, __FILE__, __LINE__);
+    cuda_leaf_value_ = shrunk;
+  }
+  DeallocateCUDAMemory<int>(&cuda_left_child_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<int>(&cuda_right_child_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<int>(&cuda_split_feature_inner_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<int>(&cuda_split_feature_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<int>(&cuda_leaf_depth_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<int>(&cuda_leaf_parent_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<uint32_t>(&cuda_threshold_in_bin_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<double>(&cuda_threshold_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<double>(&cuda_internal_weight_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<double>(&cuda_internal_value_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<int8_t>(&cuda_decision_type_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<data_size_t>(&cuda_leaf_count_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<double>(&cuda_leaf_weight_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<data_size_t>(&cuda_internal_count_, __FILE__, __LINE__);
+  DeallocateCUDAMemory<float>(&cuda_split_gain_, __FILE__, __LINE__);
+  // Destroy the per-tree CUDA stream — it's only used during construction by
+  // SplitKernel/SplitCategoricalKernel; nothing post-ToHost needs it. Without
+  // this, 60k live trees keep 60k driver streams alive, growing per-iter
+  // scheduling overhead linearly with num_trees and accounting for most of
+  // the observed TPS decay (11.8 → 5.4 over 9k iters).
   if (cuda_stream_ != nullptr) {
-    gpuAssert(cudaStreamDestroy(cuda_stream_), __FILE__, __LINE__);
+    cudaStreamDestroy(cuda_stream_);
     cuda_stream_ = nullptr;
   }
 }
@@ -347,8 +396,18 @@ void CUDATree::SyncLeafOutputFromCUDAToHost() {
 
 void CUDATree::AsConstantTree(double val, int count) {
   Tree::AsConstantTree(val, count);
+  // After ToHost, cuda_leaf_count_ may have been freed for memory reuse —
+  // GBDT calls AsConstantTree for trees that didn't grow (1-leaf trees), so
+  // guard the GPU writes. The host vectors are already updated by
+  // Tree::AsConstantTree above; cuda_leaf_value_ is kept alive for
+  // AddPredictionToScore (re-allocate at size 1 if previously freed).
+  if (cuda_leaf_value_ == nullptr) {
+    AllocateCUDAMemory<double>(&cuda_leaf_value_, 1, __FILE__, __LINE__);
+  }
   CopyFromHostToCUDADevice<double>(cuda_leaf_value_, &val, 1, __FILE__, __LINE__);
-  CopyFromHostToCUDADevice<int>(cuda_leaf_count_, &count, 1, __FILE__, __LINE__);
+  if (cuda_leaf_count_ != nullptr) {
+    CopyFromHostToCUDADevice<int>(cuda_leaf_count_, &count, 1, __FILE__, __LINE__);
+  }
 }
 
 }  // namespace LightGBM
