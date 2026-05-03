@@ -50,7 +50,11 @@ CUDATree::~CUDATree() {
   DeallocateCUDAMemory<double>(&cuda_leaf_weight_, __FILE__, __LINE__);
   DeallocateCUDAMemory<data_size_t>(&cuda_internal_count_, __FILE__, __LINE__);
   DeallocateCUDAMemory<float>(&cuda_split_gain_, __FILE__, __LINE__);
-  gpuAssert(cudaStreamDestroy(cuda_stream_), __FILE__, __LINE__);
+  // ToHost() may have already destroyed the stream — guard against
+  // double-destroy.
+  if (cuda_stream_ != nullptr) {
+    gpuAssert(cudaStreamDestroy(cuda_stream_), __FILE__, __LINE__);
+  }
 }
 
 void CUDATree::InitCUDAMemory() {
@@ -320,6 +324,17 @@ void CUDATree::ToHost() {
   }
 
   SynchronizeCUDADevice(__FILE__, __LINE__);
+
+  // Destroy the per-tree CUDA stream now that the tree is finalized on the
+  // host. cuda_stream_ is only used by SplitKernel/SplitCategoricalKernel
+  // during tree construction, never post-ToHost. Without this, every Tree
+  // kept in the booster's models_ list holds an additional live stream until
+  // booster destruction, growing CUDA driver scheduling overhead linearly
+  // with num_trees and producing observable per-iteration TPS decay.
+  if (cuda_stream_ != nullptr) {
+    gpuAssert(cudaStreamDestroy(cuda_stream_), __FILE__, __LINE__);
+    cuda_stream_ = nullptr;
+  }
 }
 
 void CUDATree::SyncLeafOutputFromHostToCUDA() {
