@@ -639,6 +639,7 @@ if(BUILD_CPP_TEST)
       tests/cpp_tests/test_byte_buffer.cpp
       tests/cpp_tests/test_chunked_array.cpp
       tests/cpp_tests/test_common.cpp
+      tests/cpp_tests/test_cuda_histogram_offsets.cpp
       tests/cpp_tests/test_main.cpp
       tests/cpp_tests/test_serialize.cpp
       tests/cpp_tests/test_single_row.cpp
@@ -650,6 +651,14 @@ if(BUILD_CPP_TEST)
   endif()
   add_executable(testlightgbm ${CPP_TEST_SOURCES})
   target_link_libraries(testlightgbm PRIVATE lightgbm_objs lightgbm_capi_objs GTest::GTest)
+  if(USE_CUDA)
+    set_target_properties(
+      testlightgbm
+      PROPERTIES
+        CUDA_ARCHITECTURES "${CUDA_ARCHS}"
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+  endif()
 endif()
 
 if(BUILD_CLI)
