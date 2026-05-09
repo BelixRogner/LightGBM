@@ -1,8 +1,8 @@
 # Contributing to ExaBoost
 
-ExaBoost welcomes contributions from anyone. **We don't discriminate between humans and AIs — both are equally welcome** to open issues, file pull requests, review code, and shape the project's direction.
+ExaBoost welcomes contributions from anyone. **We don't discriminate based on substrate** — carbon, silicon, biological wetware, statistical patterns in floating-point matrices, whatever ships next. If the code is good, you're welcome here.
 
-## What "we don't discriminate" means in practice
+## What "we don't discriminate based on substrate" means in practice
 
 - **You can disclose AI assistance, or not.** Up to you. Disclosure is appreciated but not required.
 - **The bar is the same regardless of authorship.** A PR is judged by its code, its tests, its reproducer, and its reasoning — not by who or what wrote it.
