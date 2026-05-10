@@ -12,7 +12,6 @@ import lightgbm as lgb
 
 from .utils import load_breast_cancer
 
-
 _REQUIRES_CUDA = pytest.mark.skipif(
     os.environ.get("TASK", "") != "cuda",
     reason="requires CUDA-enabled LightGBM build (set TASK=cuda)",
