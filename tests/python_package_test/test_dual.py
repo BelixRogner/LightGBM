@@ -110,7 +110,9 @@ def test_cuda_bitonic_argsort_1024_with_distinct_scores_matches_cpu():
     preds = {}
     for dev in ("cpu", "cuda"):
         ds = lgb.Dataset(
-            X, label=y, categorical_feature=[0],
+            X,
+            label=y,
+            categorical_feature=[0],
             params={"verbose": -1, "feature_pre_filter": False},
         )
         bst = lgb.train({**base, "device_type": dev}, ds, num_boost_round=1)
@@ -120,9 +122,7 @@ def test_cuda_bitonic_argsort_1024_with_distinct_scores_matches_cpu():
     # split-finder chooses a different threshold and predictions diverge by
     # ~O(category mean magnitude). 1e-3 is well above CPU/CUDA FP drift on a
     # one-tree fit but well below any wrong-split signal.
-    assert diff < 1e-3, (
-        f"CPU vs CUDA prediction disagreement on categorical split: max|Δ|={diff:.4e}"
-    )
+    assert diff < 1e-3, f"CPU vs CUDA prediction disagreement on categorical split: max|Δ|={diff:.4e}"
 
 
 @pytest.mark.skipif(
