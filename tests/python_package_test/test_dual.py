@@ -76,9 +76,7 @@ def _train_cpu_and_cuda(params_overrides, X, y, num_round):
             "min_sum_hessian_in_leaf": 1e-3,
             **params_overrides,
         }
-        ds = lgb.Dataset(
-            X, label=y, params={"verbose": -1, "feature_pre_filter": False}
-        )
+        ds = lgb.Dataset(X, label=y, params={"verbose": -1, "feature_pre_filter": False})
         out[device_type] = lgb.train(params, ds, num_boost_round=num_round)
     return out
 
