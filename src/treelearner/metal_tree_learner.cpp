@@ -20,6 +20,8 @@
 #include "feature_histogram.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -180,6 +182,29 @@ kernel void histogram_partial_indexed(
 
 }  // namespace
 
+// Set via LIGHTGBM_METAL_TIMING=1 — accumulates per-call timings so users can
+// see where the GPU path is spending time. Reported once at process exit.
+struct MetalTimings {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> idx_copy_us{0};
+  std::atomic<uint64_t> dispatch_us{0};   // commit + waitUntilCompleted
+  std::atomic<uint64_t> writeback_us{0};
+  bool enabled = false;
+  ~MetalTimings() {
+    if (enabled && calls.load() > 0) {
+      uint64_t n = calls.load();
+      std::fprintf(stderr,
+        "[metal-timing] calls=%llu  idx_copy=%.2fms  dispatch=%.2fms  writeback=%.2fms  "
+        "(per-call avg: idx_copy=%.2fus dispatch=%.2fus writeback=%.2fus)\n",
+        (unsigned long long)n,
+        idx_copy_us.load() / 1000.0, dispatch_us.load() / 1000.0, writeback_us.load() / 1000.0,
+        (double)idx_copy_us.load() / n, (double)dispatch_us.load() / n,
+        (double)writeback_us.load() / n);
+    }
+  }
+};
+static MetalTimings g_timings;
+
 struct MetalTreeLearner::MetalState {
   MTL::Device*               device  = nullptr;
   MTL::CommandQueue*         queue   = nullptr;
@@ -246,6 +271,11 @@ void MetalTreeLearner::ResetTrainingDataInner(const Dataset* train_data,
 }
 
 void MetalTreeLearner::InitMetal() {
+  // Honor LIGHTGBM_METAL_TIMING once globally (per process).
+  if (const char* env = std::getenv("LIGHTGBM_METAL_TIMING")) {
+    if (env[0] == '1') g_timings.enabled = true;
+  }
+
   state_->device = MTL::CreateSystemDefaultDevice();
   if (!state_->device) {
     Log::Warning("Metal: no system default device found. Falling back to CPU path.");
@@ -474,8 +504,15 @@ void MetalTreeLearner::RunMetalHistogramIndexed(const data_size_t* data_indices,
   // is bitwise identical to uint32_t — memcpy is safe.
   static_assert(sizeof(data_size_t) == sizeof(uint32_t),
                 "Metal indexed kernel assumes data_size_t is 32-bit.");
+  auto t_idx0 = g_timings.enabled ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point();
   std::memcpy(state_->idx_buf->contents(), data_indices,
               (size_t)num_idx * sizeof(uint32_t));
+  if (g_timings.enabled) {
+    auto t1 = std::chrono::steady_clock::now();
+    g_timings.idx_copy_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t_idx0).count());
+  }
 
   uint32_t nd  = (uint32_t)state_->num_data;
   uint32_t ni  = (uint32_t)num_idx;
@@ -530,6 +567,8 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
   const data_size_t leaf_num_data = smaller_leaf_splits_->num_data_in_leaf();
   const data_size_t* data_indices = smaller_leaf_splits_->data_indices();
 
+  auto t_disp0 = g_timings.enabled ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point();
   if (data_indices == nullptr || leaf_num_data == state_->num_data) {
     // Root-leaf, full-data path: run the un-indexed kernel.
     RunMetalHistogram(gradients_, hessians_, state_->num_data);
@@ -537,7 +576,16 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
     // Deeper-leaf path: scatter-gather via the indices buffer on the GPU.
     RunMetalHistogramIndexed(data_indices, leaf_num_data);
   }
+  if (g_timings.enabled) {
+    auto t1 = std::chrono::steady_clock::now();
+    // dispatch_us absorbs idx_copy too — we subtract that below if it ran.
+    g_timings.dispatch_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t_disp0).count());
+    g_timings.calls.fetch_add(1);
+  }
 
+  auto t_wb0 = g_timings.enabled ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point();
   const float* metal_hist = static_cast<const float*>(state_->out_buf->contents());
   const int num_features = train_data_->num_features();
   // Per-feature write-back. smaller_leaf_histogram_array_[f].RawData() points
@@ -557,6 +605,11 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
       dst[2 * (b - offset) + 0] = src[2 * b + 0];
       dst[2 * (b - offset) + 1] = src[2 * b + 1];
     }
+  }
+  if (g_timings.enabled) {
+    auto t1 = std::chrono::steady_clock::now();
+    g_timings.writeback_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t_wb0).count());
   }
 
   // Larger leaf is computed via subtract in the caller when use_subtract=true.
