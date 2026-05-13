@@ -290,6 +290,36 @@ def test_quantile_regression_parity():
     assert rel < 0.05, (cpu_p75, metal_p75)
 
 
+def test_large_scale_drift():
+    """Stress test with 100k rows + 128 features + 100 trees. Each
+    histogram cell accumulates ~800 floats; atomic-ordering drift
+    compounds across many splits across many trees. Asserts AUC parity
+    holds at scale.
+
+    Skipped under LIGHTGBM_TEST_METAL_QUICK=1 (CI tier-1) to keep the
+    suite fast — it's the longest of the parity tests."""
+    if os.environ.get("LIGHTGBM_TEST_METAL_QUICK") == "1":
+        pytest.skip("quick mode")
+    X, y = make_classification(
+        n_samples=100_000, n_features=128, n_informative=40, n_redundant=20,
+        flip_y=0.02, random_state=42,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.1, random_state=42
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 63, "learning_rate": 0.05},
+        X_train, y_train, X_test, y_test, num_rounds=100,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.005), (cpu_auc, metal_auc)
+    # Per-prediction agreement: 99% of predictions within 0.01 of CPU.
+    diff = np.abs(metal_pred - cpu_pred)
+    pct_99 = np.quantile(diff, 0.99)
+    assert pct_99 < 0.05, f"99th percentile prediction diff: {pct_99:.4f}"
+
+
 def test_metal_init_smoke():
     """Smoke test: Metal device initializes and produces a non-degenerate model."""
     X, y = make_classification(n_samples=500, n_features=16, random_state=3)
