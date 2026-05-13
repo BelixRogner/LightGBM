@@ -395,6 +395,21 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_tiny_dataset_falls_back_to_cpu():
+    """Datasets too small to benefit from Metal (few features) fall back
+    to CPU cleanly without crashing. Mirrors what users get with the
+    binary_classification example (28 features < default 96 threshold)."""
+    X, y = make_classification(n_samples=500, n_features=8, random_state=23)
+    bst = lgb.train(
+        {"objective": "binary", "num_leaves": 7, "verbosity": -1,
+         "device_type": "metal"},
+        lgb.Dataset(X, y), num_boost_round=5,
+    )
+    pred = bst.predict(X)
+    assert np.all(np.isfinite(pred))
+    assert 0.0 <= pred.min() and pred.max() <= 1.0
+
+
 def test_very_many_features():
     """Stress test: 1024 features. Verifies the auto-tuned wg_per_feat
     handles wide datasets correctly (wg_per_feat should hit 1 here,
