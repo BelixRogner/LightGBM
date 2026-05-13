@@ -183,16 +183,39 @@ What's left to harden:
 - Async / batched dispatch — currently each leaf waits on its own command
   buffer; batching across siblings would cut fixed overhead.
 
+### Phase 2.5 — multi-feature-group support — DONE
+
+Datasets where LightGBM packs narrow features into shared feature groups
+(triggered by low `max_bin`) are now Metal-eligible. Materialization uses
+`BinIterator::Get` (not `RawGet`) so per-sub-feature bin values are
+correctly extracted; per-feature write-back uses
+`smaller_leaf_histogram_array_[f].RawData()` directly.
+
+### Phase 2.6 — macOS arm64 CI — DONE
+
+`.github/workflows/metal.yml` builds with `USE_METAL=ON` + `BUILD_CPP_TEST=ON`
+on `macos-latest` and runs the cpp + Python parity suites.
+
+### Phase 2.8 — README docs — DONE
+
+User-facing docs for building, eligibility, and env-var tuning knobs
+(`LIGHTGBM_METAL_MIN_FEATURES`, `LIGHTGBM_METAL_WG_PER_FEAT`,
+`LIGHTGBM_METAL_TIMING`).
+
 ### Phase 3 — beyond histograms — FUTURE
 
-- Multi-feature-group packing (Feature4-style `uchar4` layout), matching the
-  OpenCL backend's full perf profile.
-- Sparse / multi-val feature handling.
-- Quantized gradient/hessian path (`use_quantized_grad=true`).
-- `MTL::BinaryArchive` for offline shader caching — skip MSL compilation on
-  every process start.
+- Sparse / multi-val feature handling (currently falls back to CPU; tested
+  via `test_sparse_input_falls_back_cleanly`).
+- Quantized gradient/hessian path (`use_quantized_grad=true`; currently
+  falls back to CPU; tested via `test_quantized_gradient_falls_back_cleanly`).
+- `MTL::BinaryArchive` for offline shader caching — skip MSL compilation
+  on every process start.
+- Multi-feature-per-threadgroup kernel — share grad/hess reads across K
+  features per dispatch. Bandwidth wins for memory-bound workloads.
 - SIMD-group reductions for further atomic-contention reduction.
-- CI: GitHub Actions `macos-14`/`macos-15` runners with `USE_METAL=ON`.
+- Async / batched dispatch via `addCompletedHandler` or pipelined CBs.
+- Restrict default heuristic: lowering `LIGHTGBM_METAL_MIN_FEATURES`
+  below 96 needs the Phase-3 perf work above to land first.
 
 ## Risks / known unknowns
 
