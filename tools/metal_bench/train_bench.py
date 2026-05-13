@@ -81,7 +81,10 @@ def bench(num_samples: int, num_features: int, num_iterations: int = 50) -> None
 
 
 if __name__ == "__main__":
+    _t0 = time.perf_counter()
     bench(num_samples=500_000, num_features=64,  num_iterations=50)
     bench(num_samples=500_000, num_features=128, num_iterations=50)
     bench(num_samples=500_000, num_features=256, num_iterations=50)
     bench(num_samples=1_000_000, num_features=128, num_iterations=30)
+    if not CSV_MODE:
+        print(f"\nTotal bench wall time: {time.perf_counter() - _t0:.1f}s")
