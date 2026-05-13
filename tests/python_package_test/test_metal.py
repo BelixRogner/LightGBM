@@ -395,6 +395,40 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_continue_training_parity():
+    """init_model=existing_model continues training from a previous state.
+    Verifies Metal handles the gradient computation correctly when starting
+    from a non-zero initial score."""
+    X, y = make_classification(
+        n_samples=3_000, n_features=128, n_informative=24, random_state=19,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=19
+    )
+    base = dict(
+        objective="binary", num_leaves=15, learning_rate=0.1,
+        verbosity=-1, deterministic=True, seed=42,
+    )
+
+    # Round 1: train initial model (20 rounds) on each device.
+    cpu_round1 = lgb.train(dict(base, device_type="cpu"),
+                            lgb.Dataset(X_train, y_train), num_boost_round=20)
+    metal_round1 = lgb.train(dict(base, device_type="metal"),
+                              lgb.Dataset(X_train, y_train), num_boost_round=20)
+
+    # Round 2: continue from round-1 model for 20 more rounds.
+    cpu_round2 = lgb.train(dict(base, device_type="cpu"),
+                            lgb.Dataset(X_train, y_train), num_boost_round=20,
+                            init_model=cpu_round1)
+    metal_round2 = lgb.train(dict(base, device_type="metal"),
+                              lgb.Dataset(X_train, y_train), num_boost_round=20,
+                              init_model=metal_round1)
+
+    cpu_auc = roc_auc_score(y_test, cpu_round2.predict(X_test))
+    metal_auc = roc_auc_score(y_test, metal_round2.predict(X_test))
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+
+
 def test_early_stopping_parity():
     """Early stopping uses a validation set during training. Verifies the
     Metal path works with the early-stopping callback path and stops at
