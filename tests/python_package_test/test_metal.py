@@ -402,6 +402,25 @@ def test_quantized_gradient_parity():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.01), (cpu_auc, metal_auc)
 
 
+def test_subsample_freq_parity():
+    """bagging_fraction without bagging_freq has different semantics
+    (every iter). Verifies that combination."""
+    X, y = make_classification(
+        n_samples=3_000, n_features=128, random_state=46,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=46
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1,
+         "bagging_fraction": 0.7, "bagging_freq": 3},
+        X_train, y_train, X_test, y_test, num_rounds=20,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+
+
 def test_max_depth_parity():
     """max_depth limits tree depth independent of num_leaves. Common
     LightGBM regularization knob."""
