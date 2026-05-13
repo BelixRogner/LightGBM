@@ -4,6 +4,7 @@ option(USE_GPU "Enable GPU-accelerated training" OFF)
 option(USE_SWIG "Enable SWIG to generate Java API" OFF)
 option(USE_TIMETAG "Set to ON to output time costs" OFF)
 option(USE_CUDA "Enable CUDA-accelerated training " OFF)
+option(USE_METAL "Enable Metal-accelerated training (Apple silicon)" OFF)
 option(USE_DEBUG "Set to ON for Debug mode" OFF)
 option(USE_SANITIZER "Use sanitizer flags" OFF)
 set(
@@ -211,6 +212,23 @@ if(__INTEGRATE_OPENCL)
     endif()
 endif()
 
+if(USE_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "USE_METAL is only supported on macOS.")
+    endif()
+    set(METAL_CPP_DIR ${PROJECT_SOURCE_DIR}/external_libs/metal-cpp)
+    if(NOT EXISTS ${METAL_CPP_DIR}/Metal/Metal.hpp)
+        message(FATAL_ERROR "metal-cpp headers not found under ${METAL_CPP_DIR}. \
+            Download from https://developer.apple.com/metal/cpp/ and extract there.")
+    endif()
+    include_directories(${METAL_CPP_DIR})
+    find_library(METAL_FRAMEWORK     Metal      REQUIRED)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+    message(STATUS "Metal framework:      ${METAL_FRAMEWORK}")
+    add_definitions(-DUSE_METAL)
+endif()
+
 if(BUILD_CPP_TEST AND MSVC)
   # Use /MT flag to statically link the C runtime
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -400,6 +418,7 @@ set(
       src/treelearner/feature_histogram.cpp
       src/treelearner/feature_parallel_tree_learner.cpp
       src/treelearner/gpu_tree_learner.cpp
+      src/treelearner/metal_tree_learner.cpp
       src/treelearner/gradient_discretizer.cpp
       src/treelearner/linear_tree_learner.cpp
       src/treelearner/serial_tree_learner.cpp
@@ -559,6 +578,15 @@ endif()
 
 if(USE_GPU)
   target_link_libraries(lightgbm_objs PUBLIC ${OpenCL_LIBRARY} ${Boost_LIBRARIES})
+endif()
+
+if(USE_METAL)
+  target_link_libraries(lightgbm_objs PUBLIC
+    ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${QUARTZCORE_FRAMEWORK})
+  # metal-cpp headers require C++17 (std::enable_if_t, std::is_convertible_v).
+  set_source_files_properties(
+    src/treelearner/metal_tree_learner.cpp
+    PROPERTIES COMPILE_FLAGS "-std=c++17")
 endif()
 
 if(__INTEGRATE_OPENCL)

@@ -192,6 +192,8 @@ void GetDeviceType(const std::unordered_map<std::string, std::string>& params, s
       *device_type = "gpu";
     } else if (value == std::string("cuda")) {
       *device_type = "cuda";
+    } else if (value == std::string("metal")) {
+      *device_type = "metal";
     } else {
       Log::Fatal("Unknown device type %s", value.c_str());
     }
@@ -417,9 +419,10 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
   }
   // linear tree learner must be serial type and run on CPU device
   if (linear_tree) {
-    if (device_type != std::string("cpu") && device_type != std::string("gpu")) {
+    if (device_type != std::string("cpu") && device_type != std::string("gpu") &&
+        device_type != std::string("metal")) {
       device_type = "cpu";
-      Log::Warning("Linear tree learner only works with CPU and GPU. Falling back to CPU now.");
+      Log::Warning("Linear tree learner only works with CPU, GPU, and Metal. Falling back to CPU now.");
     }
     if (tree_learner != std::string("serial")) {
       tree_learner = "serial";

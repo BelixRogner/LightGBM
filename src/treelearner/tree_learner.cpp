@@ -6,6 +6,7 @@
 
 #include "gpu_tree_learner.h"
 #include "linear_tree_learner.h"
+#include "metal_tree_learner.h"
 #include "parallel_tree_learner.h"
 #include "serial_tree_learner.h"
 #include "cuda/cuda_single_gpu_tree_learner.hpp"
@@ -51,6 +52,20 @@ TreeLearner* TreeLearner::CreateTreeLearner(const std::string& learner_type, con
       }
     } else {
       Log::Fatal("Currently cuda version only supports training on a single machine.");
+    }
+  } else if (device_type == std::string("metal")) {
+    if (learner_type == std::string("serial")) {
+      if (config->linear_tree) {
+        return new LinearTreeLearner<MetalTreeLearner>(config);
+      } else {
+        return new MetalTreeLearner(config);
+      }
+    } else if (learner_type == std::string("feature")) {
+      return new FeatureParallelTreeLearner<MetalTreeLearner>(config);
+    } else if (learner_type == std::string("data")) {
+      return new DataParallelTreeLearner<MetalTreeLearner>(config);
+    } else if (learner_type == std::string("voting")) {
+      return new VotingParallelTreeLearner<MetalTreeLearner>(config);
     }
   }
   return nullptr;
