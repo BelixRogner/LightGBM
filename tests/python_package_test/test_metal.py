@@ -395,6 +395,32 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_poisson_objective_parity():
+    """Poisson regression has a log-link function producing non-Gaussian
+    gradients. Verifies Metal histograms work with that gradient profile."""
+    rng = np.random.default_rng(33)
+    n, p = 3_000, 64
+    X = rng.normal(size=(n, p))
+    # Generate count labels with log-linear means.
+    rate = np.exp(X[:, 0] * 0.5 + 1.5)
+    y = rng.poisson(rate)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=33
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "poisson", "num_leaves": 15, "learning_rate": 0.05},
+        X_train, y_train.astype(float), X_test, y_test.astype(float),
+        num_rounds=30,
+    )
+    # Poisson predictions are non-negative real-valued; compare per-sample
+    # absolute error.
+    diff = np.abs(metal_pred - cpu_pred)
+    median_diff = float(np.median(diff))
+    # Both should be in the same scale as the rate; median diff should
+    # be a small fraction.
+    assert median_diff < 1.0, f"median |metal - cpu|: {median_diff}"
+
+
 def test_huber_objective_parity():
     """Huber regression objective has a piecewise-linear gradient. Tests
     that the Metal histogram path stays correct under non-quadratic
