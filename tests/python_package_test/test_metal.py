@@ -400,6 +400,24 @@ def test_quantized_gradient_parity():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.01), (cpu_auc, metal_auc)
 
 
+def test_quantized_regression_parity():
+    """Quantized regression: l2 objective + int8 gradients + 32-bit hists."""
+    X, y = make_regression(
+        n_samples=3_000, n_features=128, noise=0.5, random_state=39,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=39
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "regression", "num_leaves": 31, "learning_rate": 0.05,
+         "use_quantized_grad": True},
+        X_train, y_train, X_test, y_test, num_rounds=30,
+    )
+    cpu_mse = mean_squared_error(y_test, cpu_pred)
+    metal_mse = mean_squared_error(y_test, metal_pred)
+    assert metal_mse == pytest.approx(cpu_mse, rel=0.05), (cpu_mse, metal_mse)
+
+
 def test_quantized_multiclass_parity():
     """Quantized + multiclass: builds num_class trees per iteration."""
     X, y = make_classification(
