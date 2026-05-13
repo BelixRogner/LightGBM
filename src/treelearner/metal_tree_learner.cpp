@@ -435,26 +435,33 @@ void MetalTreeLearner::RunMetalHistogram(const score_t* /*gradients*/,
   uint32_t nd = (uint32_t)num_data;
   uint32_t wg = (uint32_t)state_->wg_per_feat;
 
+  // Fast path: when wg_per_feat==1, the partial kernel already produces the
+  // final histogram (no reduction needed). Skip the reduce dispatch.
+  const bool one_wg = (state_->wg_per_feat == 1);
+  MTL::Buffer* partial_dst = one_wg ? state_->out_buf : state_->partial_buf;
+
   MTL::CommandBuffer* cb = state_->queue->commandBuffer();
   MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
   enc->setComputePipelineState(state_->active->pso_partial);
   enc->setBuffer(state_->feat_buf, 0, 0);
   enc->setBuffer(state_->grad_buf, 0, 1);
   enc->setBuffer(state_->hess_buf, 0, 2);
-  enc->setBuffer(state_->partial_buf, 0, 3);
+  enc->setBuffer(partial_dst, 0, 3);
   enc->setBytes(&nd, sizeof(uint32_t), 4);
   enc->setBytes(&wg, sizeof(uint32_t), 5);
   enc->dispatchThreadgroups(
       MTL::Size::Make(state_->wg_per_feat, state_->num_metal_features, 1),
       MTL::Size::Make(kThreadsPerGroup, 1, 1));
 
-  enc->setComputePipelineState(state_->active->pso_reduce);
-  enc->setBuffer(state_->partial_buf, 0, 0);
-  enc->setBuffer(state_->out_buf, 0, 1);
-  enc->setBytes(&wg, sizeof(uint32_t), 2);
-  enc->dispatchThreadgroups(
-      MTL::Size::Make(state_->num_metal_features, 1, 1),
-      MTL::Size::Make(state_->active_bins, 1, 1));
+  if (!one_wg) {
+    enc->setComputePipelineState(state_->active->pso_reduce);
+    enc->setBuffer(state_->partial_buf, 0, 0);
+    enc->setBuffer(state_->out_buf, 0, 1);
+    enc->setBytes(&wg, sizeof(uint32_t), 2);
+    enc->dispatchThreadgroups(
+        MTL::Size::Make(state_->num_metal_features, 1, 1),
+        MTL::Size::Make(state_->active_bins, 1, 1));
+  }
   enc->endEncoding();
   cb->commit();
   cb->waitUntilCompleted();
@@ -474,13 +481,17 @@ void MetalTreeLearner::RunMetalHistogramIndexed(const data_size_t* data_indices,
   uint32_t ni  = (uint32_t)num_idx;
   uint32_t wg  = (uint32_t)state_->wg_per_feat;
 
+  // Same wg_per_feat==1 fast path as RunMetalHistogram (skip reduce).
+  const bool one_wg = (state_->wg_per_feat == 1);
+  MTL::Buffer* partial_dst = one_wg ? state_->out_buf : state_->partial_buf;
+
   MTL::CommandBuffer* cb = state_->queue->commandBuffer();
   MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
   enc->setComputePipelineState(state_->active->pso_partial_indexed);
   enc->setBuffer(state_->feat_buf, 0, 0);
   enc->setBuffer(state_->grad_buf, 0, 1);
   enc->setBuffer(state_->hess_buf, 0, 2);
-  enc->setBuffer(state_->partial_buf, 0, 3);
+  enc->setBuffer(partial_dst, 0, 3);
   enc->setBytes(&nd, sizeof(uint32_t), 4);
   enc->setBytes(&wg, sizeof(uint32_t), 5);
   enc->setBuffer(state_->idx_buf, 0, 6);
@@ -489,13 +500,15 @@ void MetalTreeLearner::RunMetalHistogramIndexed(const data_size_t* data_indices,
       MTL::Size::Make(state_->wg_per_feat, state_->num_metal_features, 1),
       MTL::Size::Make(kThreadsPerGroup, 1, 1));
 
-  enc->setComputePipelineState(state_->active->pso_reduce);
-  enc->setBuffer(state_->partial_buf, 0, 0);
-  enc->setBuffer(state_->out_buf, 0, 1);
-  enc->setBytes(&wg, sizeof(uint32_t), 2);
-  enc->dispatchThreadgroups(
-      MTL::Size::Make(state_->num_metal_features, 1, 1),
-      MTL::Size::Make(state_->active_bins, 1, 1));
+  if (!one_wg) {
+    enc->setComputePipelineState(state_->active->pso_reduce);
+    enc->setBuffer(state_->partial_buf, 0, 0);
+    enc->setBuffer(state_->out_buf, 0, 1);
+    enc->setBytes(&wg, sizeof(uint32_t), 2);
+    enc->dispatchThreadgroups(
+        MTL::Size::Make(state_->num_metal_features, 1, 1),
+        MTL::Size::Make(state_->active_bins, 1, 1));
+  }
   enc->endEncoding();
   cb->commit();
   cb->waitUntilCompleted();

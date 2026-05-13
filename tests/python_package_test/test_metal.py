@@ -170,6 +170,26 @@ def test_categorical_features_parity():
     assert metal_auc > 0.6
 
 
+def test_64bin_kernel_parity():
+    """max_bin=60 forces the 64-bin Metal kernel variant. Verifies that
+    pipeline state separate from the default 256-bin variant produces
+    matching results."""
+    X, y = make_classification(
+        n_samples=4_000, n_features=64, n_informative=20, random_state=8,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=8
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1, "max_bin": 60},
+        X_train, y_train, X_test, y_test,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+    assert metal_auc > 0.7
+
+
 def test_binary_classification_multifeature_group_parity():
     """Force LightGBM to pack features into multi-feature groups (low max_bin)
     and verify cpu vs metal still match. Exercises the multi-feature-group
