@@ -170,6 +170,47 @@ def test_categorical_features_parity():
     assert metal_auc > 0.6
 
 
+def test_bagging_parity():
+    """bagging_fraction != 1.0 subsamples rows each iteration; the Metal
+    indexed-kernel path must handle this. Tight tolerance because bagging is
+    a common LightGBM use case and silent drift here would hurt real users."""
+    X, y = make_classification(
+        n_samples=5_000, n_features=64, n_informative=20, random_state=11,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=11
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1,
+         "bagging_fraction": 0.5, "bagging_freq": 1},
+        X_train, y_train, X_test, y_test, num_rounds=40,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+    assert metal_auc > 0.7
+
+
+def test_feature_fraction_parity():
+    """feature_fraction < 1 randomly disables features per-tree. Metal must
+    correctly honor is_feature_used in the per-feature write-back."""
+    X, y = make_classification(
+        n_samples=5_000, n_features=96, n_informative=24, random_state=12,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=12
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1,
+         "feature_fraction": 0.5},
+        X_train, y_train, X_test, y_test, num_rounds=40,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+    assert metal_auc > 0.7
+
+
 def test_64bin_kernel_parity():
     """max_bin=60 forces the 64-bin Metal kernel variant. Verifies that
     pipeline state separate from the default 256-bin variant produces
