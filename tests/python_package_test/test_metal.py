@@ -395,6 +395,25 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_l1_regularization_parity():
+    """lambda_l1 changes the split-gain formula; verifies the histogram
+    output produces the same regularized splits on cpu and metal."""
+    X, y = make_classification(
+        n_samples=3_000, n_features=128, n_informative=24, random_state=26,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=26
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1,
+         "lambda_l1": 1.0, "lambda_l2": 0.5},
+        X_train, y_train, X_test, y_test, num_rounds=30,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+
+
 def test_realistic_production_config():
     """Combines bagging, feature_fraction, early stopping, and ndcg-style
     multiclass — the kind of config a real production tabular ML job
