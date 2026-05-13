@@ -20,6 +20,7 @@
 #include "feature_histogram.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -286,6 +287,22 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   // materialize a packed [num_features × num_data] uchar buffer once.
   const int num_groups   = train_data_->num_feature_groups();
   const int num_features = train_data_->num_features();
+
+  // Heuristic: Metal dispatch overhead dominates on very narrow datasets where
+  // the GPU is underfilled. Default crossover is ~96 features on M4 Pro
+  // (measured via tools/metal_bench/train_bench.py). Override with the env var.
+  int min_features = 96;
+  if (const char* env = std::getenv("LIGHTGBM_METAL_MIN_FEATURES")) {
+    int v = std::atoi(env);
+    if (v > 0) min_features = v;
+  }
+  if (num_features < min_features) {
+    Log::Info("Metal: skipping acceleration (num_features=%d < min=%d). "
+              "Override with LIGHTGBM_METAL_MIN_FEATURES.",
+              num_features, min_features);
+    return false;
+  }
+
   if (num_groups != num_features) {
     Log::Info("Metal: skipping acceleration (multi-feature groups detected).");
     return false;

@@ -146,41 +146,44 @@ Inventory, plan, branch (`metal-backend`).
 - `build-python.sh --metal` flag forwards `USE_METAL=ON` and bundles metal-cpp
   into the isolated source dir.
 
-### Phase 2.1 — actual Metal acceleration — IN PROGRESS (next coding work)
+## End-to-end training benchmark
 
-Wire the Metal kernel into `MetalTreeLearner::ConstructHistograms` so the
-device actually does work. Strategy:
+Apple M4 Pro, 50 iters, `num_leaves=63`, deterministic:
 
-1. **Eligibility check at `Init`**: a dataset is Metal-eligible if
-   - `!config_->use_quantized_grad` (Phase 2.1 doesn't handle int8/int16)
-   - Each feature group has exactly 1 feature (no Feature4 packing yet)
-   - All features have `≤ 256` bins
-   - No multi-val / sparse features in those groups
-   Store the list of eligible feature indices in `metal_feature_groups_`.
+| Dataset            | CPU      | Metal    | Speedup | AUC parity |
+|--------------------|----------|----------|---------|------------|
+|   500k × 64        |  1.45s   |  1.57s¹  | 0.92×   | bit-exact  |
+|   500k × 128       |  2.39s   |  2.51s   | 0.95×   | bit-exact  |
+|   500k × 256       |  4.31s   |  3.47s   | **1.24×** | bit-exact |
+|   1M × 128 (30it)  |  2.71s   |  2.20s   | **1.23×** | bit-exact |
 
-2. **Feature materialization** (once, in `Init` after `SerialTreeLearner::Init`):
-   for each eligible feature `f`, iterate `Dataset::FeatureIterator(f)` and pack
-   bin indices into a single `uchar[num_eligible × num_data]` device buffer.
-   Stored in `MetalState::feat_buf`.
+¹ 64 features falls under the `LIGHTGBM_METAL_MIN_FEATURES=96` heuristic and
+runs on CPU; the small overhead is Metal init.
 
-3. **`ConstructHistograms` override**:
-   a. If not eligible → delegate to `SerialTreeLearner::ConstructHistograms`.
-   b. Compute ordered gradients/hessians for the smaller leaf via the same
-      logic SerialTreeLearner uses (data_indices reorder).
-   c. Copy ordered g/h into shared Metal buffers (zero-copy on Apple silicon).
-   d. Dispatch `histogram_partial` + `histogram_reduce`.
-   e. For each eligible feature `f`, write Metal output into
-      `smaller_leaf_histogram_array_[0].RawData() - kHistOffset + 2*GroupBinBoundary(f)`.
-   f. For non-eligible features, call the CPU path on just those.
-   g. Larger leaf: use subtract trick (already in base class).
+End-to-end speedup is more modest than the standalone-kernel benchmark (2-3×)
+because tree-building has substantial non-histogram work (split finding,
+score updates, …). Speedup grows with `num_features` and `num_data`; the
+crossover where Metal helps is roughly `num_features * num_data ≥ 1e8`.
 
-4. **Bin-size selection**: pick which of `histogram{16,64,256}` kernels to
-   dispatch based on `max_num_bin` across eligible features. Saves threadgroup
-   memory at low bin counts. (Kernel sources already in `src/treelearner/metal/`.)
+### Phase 2.1 — actual Metal acceleration — DONE
 
-5. **Verification mode** (env `LIGHTGBM_METAL_VERIFY=1`): run both CPU and
-   Metal, assert ULP-level agreement, log any drift. Catches kernel regressions
-   immediately during development.
+Wired the Metal kernel into `MetalTreeLearner::ConstructHistograms`. Both the
+root-leaf path (un-indexed kernel) and the deeper-leaf path (indexed kernel,
+scatter-gather via a `uint indices[num_idx]` buffer) run on Metal.
+Histograms are written back via `GroupBinBoundary(f)` offsets into the global
+`hist_t` array.
+
+Eligibility check at `Init`: single-feature groups, `num_features ≥ 96`
+(`LIGHTGBM_METAL_MIN_FEATURES` overrides), no multi-val, `≤ 256` bins,
+non-quantized gradients. Anything else delegates to `SerialTreeLearner`.
+
+What's left to harden:
+- Bin-size selection (currently always runs the 256-bin kernel; histogram16/64
+  sources are present but not yet compiled and dispatched).
+- `LIGHTGBM_METAL_VERIFY=1` mode running both CPU and Metal with ULP-level
+  drift assertions.
+- Async / batched dispatch — currently each leaf waits on its own command
+  buffer; batching across siblings would cut fixed overhead.
 
 ### Phase 3 — beyond histograms — FUTURE
 
