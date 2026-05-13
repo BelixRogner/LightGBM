@@ -400,6 +400,39 @@ def test_quantized_gradient_parity():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.01), (cpu_auc, metal_auc)
 
 
+def test_quantized_with_early_stopping_parity():
+    """Quantized + early stopping: validates the quantized path through
+    the full eval+stop callback."""
+    X, y = make_classification(
+        n_samples=4_000, n_features=128, random_state=42,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42
+    )
+    base = dict(
+        objective="binary", num_leaves=31, learning_rate=0.1,
+        use_quantized_grad=True, verbosity=-1,
+        deterministic=True, seed=42,
+    )
+    cpu_train = lgb.Dataset(X_train, y_train)
+    cpu_val = lgb.Dataset(X_test, y_test, reference=cpu_train)
+    cpu_bst = lgb.train(
+        dict(base, device_type="cpu"),
+        cpu_train, num_boost_round=100, valid_sets=[cpu_val],
+        callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=False)],
+    )
+    metal_train = lgb.Dataset(X_train, y_train)
+    metal_val = lgb.Dataset(X_test, y_test, reference=metal_train)
+    metal_bst = lgb.train(
+        dict(base, device_type="metal"),
+        metal_train, num_boost_round=100, valid_sets=[metal_val],
+        callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=False)],
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_bst.predict(X_test))
+    metal_auc = roc_auc_score(y_test, metal_bst.predict(X_test))
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+
+
 def test_quantized_with_feature_fraction_parity():
     """Quantized + feature_fraction: feature subsampling per tree."""
     X, y = make_classification(
