@@ -49,6 +49,7 @@ class MetalTreeLearner : public SerialTreeLearner {
   bool BuildDenseFeatureBuffer();  // copies eligible dense features into a uchar buffer
   void RunMetalHistogram(const score_t* gradients, const score_t* hessians,
                          data_size_t num_data);
+  void RunMetalHistogramIndexed(const data_size_t* data_indices, data_size_t num_idx);
 
   struct MetalState;
   std::unique_ptr<MetalState> state_;
