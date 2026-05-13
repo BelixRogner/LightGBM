@@ -395,6 +395,31 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_min_features_env_override():
+    """LIGHTGBM_METAL_MIN_FEATURES env var should change the heuristic
+    threshold. Sets it to 8 (well below default 96) so a small-feature
+    dataset uses Metal; verifies training succeeds and produces a usable
+    model (rather than silently corrupting results)."""
+    orig = os.environ.get("LIGHTGBM_METAL_MIN_FEATURES")
+    os.environ["LIGHTGBM_METAL_MIN_FEATURES"] = "8"
+    try:
+        X, y = make_classification(n_samples=800, n_features=16, random_state=24)
+        bst = lgb.train(
+            {"objective": "binary", "num_leaves": 7, "verbosity": -1,
+             "device_type": "metal", "deterministic": True, "seed": 0},
+            lgb.Dataset(X, y), num_boost_round=10,
+        )
+        pred = bst.predict(X)
+        assert np.all(np.isfinite(pred))
+        # Should be a decent classifier on this recoverable dataset.
+        assert roc_auc_score(y, pred) > 0.85
+    finally:
+        if orig is None:
+            del os.environ["LIGHTGBM_METAL_MIN_FEATURES"]
+        else:
+            os.environ["LIGHTGBM_METAL_MIN_FEATURES"] = orig
+
+
 def test_tiny_dataset_falls_back_to_cpu():
     """Datasets too small to benefit from Metal (few features) fall back
     to CPU cleanly without crashing. Mirrors what users get with the
