@@ -395,6 +395,45 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_realistic_production_config():
+    """Combines bagging, feature_fraction, early stopping, and ndcg-style
+    multiclass — the kind of config a real production tabular ML job
+    might use. Catches integration bugs that simpler tests miss."""
+    X, y = make_classification(
+        n_samples=8_000, n_features=192, n_informative=40, n_redundant=15,
+        flip_y=0.02, random_state=25,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=25
+    )
+    base = dict(
+        objective="binary", num_leaves=63, learning_rate=0.05,
+        feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=5,
+        lambda_l1=0.01, lambda_l2=0.1,
+        verbosity=-1, deterministic=True, seed=42,
+        min_data_in_leaf=50,
+    )
+    cpu_ds = lgb.Dataset(X_train, y_train)
+    cpu_val = lgb.Dataset(X_test, y_test, reference=cpu_ds)
+    cpu_bst = lgb.train(
+        dict(base, device_type="cpu"), cpu_ds, num_boost_round=200,
+        valid_sets=[cpu_val],
+        callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)],
+    )
+    metal_ds = lgb.Dataset(X_train, y_train)
+    metal_val = lgb.Dataset(X_test, y_test, reference=metal_ds)
+    metal_bst = lgb.train(
+        dict(base, device_type="metal"), metal_ds, num_boost_round=200,
+        valid_sets=[metal_val],
+        callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)],
+    )
+
+    cpu_auc = roc_auc_score(y_test, cpu_bst.predict(X_test))
+    metal_auc = roc_auc_score(y_test, metal_bst.predict(X_test))
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+    assert metal_auc > 0.85
+
+
 def test_min_features_env_override():
     """LIGHTGBM_METAL_MIN_FEATURES env var should change the heuristic
     threshold. Sets it to 8 (well below default 96) so a small-feature
