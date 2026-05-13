@@ -51,6 +51,10 @@ class MetalTreeLearner : public SerialTreeLearner {
   void RunMetalHistogram(const score_t* gradients, const score_t* hessians,
                          data_size_t num_data);
   void RunMetalHistogramIndexed(const data_size_t* data_indices, data_size_t num_idx);
+  // Quantized variants: read int8 packed grad+hess, produce int32 histograms.
+  // Caller is responsible for staging gh_packed_buf before calling.
+  void RunMetalHistogramQ32(data_size_t num_data);
+  void RunMetalHistogramQ32Indexed(const data_size_t* data_indices, data_size_t num_idx);
 
   struct MetalState;
   std::unique_ptr<MetalState> state_;

@@ -195,6 +195,127 @@ kernel void histogram_partial_k2(
     }
 }
 
+// ---- Quantized-gradient kernels (use_quantized_grad=true, 32-bit case) ----
+
+// Reads int8 packed grad+hess (byte 2*i = grad, byte 2*i+1 = hess),
+// atomic-int32-adds into per-SIMD-group sub-histograms, writes int32 output.
+kernel void histogram_partial_q32(
+    device const uchar*  features      [[ buffer(0) ]],
+    device const char*   gh_packed     [[ buffer(1) ]],   // [2 * num_data] int8s
+    device int32_t*      partial_hist  [[ buffer(2) ]],
+    constant uint&       num_data      [[ buffer(3) ]],
+    constant uint&       wg_per_feat   [[ buffer(4) ]],
+    uint3 tid3      [[ thread_position_in_threadgroup ]],
+    uint3 gid       [[ threadgroup_position_in_grid ]],
+    uint3 tg_sz3    [[ threads_per_threadgroup ]],
+    uint  sg_idx    [[ simdgroup_index_in_threadgroup ]])
+{
+    uint tid = tid3.x, tg_sz = tg_sz3.x;
+    threadgroup atomic_int local_grad[NUM_SUBHIST][NUM_BINS];
+    threadgroup atomic_int local_hess[NUM_SUBHIST][NUM_BINS];
+    for (uint i = tid; i < NUM_SUBHIST * NUM_BINS; i += tg_sz) {
+        uint s = i / NUM_BINS, b = i % NUM_BINS;
+        atomic_store_explicit(&local_grad[s][b], 0, memory_order_relaxed);
+        atomic_store_explicit(&local_hess[s][b], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint feat_id = gid.y, wg_in_feat = gid.x;
+    uint per_wg = (num_data + wg_per_feat - 1) / wg_per_feat;
+    uint start = wg_in_feat * per_wg, end = min(start + per_wg, num_data);
+    device const uchar* col = features + (uint64_t)feat_id * num_data;
+    uint sub = sg_idx % NUM_SUBHIST;
+    for (uint i = start + tid; i < end; i += tg_sz) {
+        uint bin = (uint)col[i];
+        int g = (int)gh_packed[2 * i];      // sign-extends int8 -> int32
+        int h = (int)gh_packed[2 * i + 1];
+        atomic_fetch_add_explicit(&local_grad[sub][bin], g, memory_order_relaxed);
+        atomic_fetch_add_explicit(&local_hess[sub][bin], h, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device int32_t* out =
+        partial_hist + ((uint64_t)feat_id * wg_per_feat + wg_in_feat) * NUM_BINS * 2;
+    for (uint b = tid; b < NUM_BINS; b += tg_sz) {
+        int g_s = 0, h_s = 0;
+        for (uint s = 0; s < NUM_SUBHIST; ++s) {
+            g_s += atomic_load_explicit(&local_grad[s][b], memory_order_relaxed);
+            h_s += atomic_load_explicit(&local_hess[s][b], memory_order_relaxed);
+        }
+        out[2 * b + 0] = g_s;
+        out[2 * b + 1] = h_s;
+    }
+}
+
+// Indexed quantized variant (deeper leaves).
+kernel void histogram_partial_q32_indexed(
+    device const uchar*  features      [[ buffer(0) ]],
+    device const char*   gh_packed     [[ buffer(1) ]],
+    device int32_t*      partial_hist  [[ buffer(2) ]],
+    constant uint&       num_data      [[ buffer(3) ]],
+    constant uint&       wg_per_feat   [[ buffer(4) ]],
+    device const uint*   indices       [[ buffer(5) ]],
+    constant uint&       num_idx       [[ buffer(6) ]],
+    uint3 tid3      [[ thread_position_in_threadgroup ]],
+    uint3 gid       [[ threadgroup_position_in_grid ]],
+    uint3 tg_sz3    [[ threads_per_threadgroup ]],
+    uint  sg_idx    [[ simdgroup_index_in_threadgroup ]])
+{
+    uint tid = tid3.x, tg_sz = tg_sz3.x;
+    threadgroup atomic_int local_grad[NUM_SUBHIST][NUM_BINS];
+    threadgroup atomic_int local_hess[NUM_SUBHIST][NUM_BINS];
+    for (uint i = tid; i < NUM_SUBHIST * NUM_BINS; i += tg_sz) {
+        uint s = i / NUM_BINS, b = i % NUM_BINS;
+        atomic_store_explicit(&local_grad[s][b], 0, memory_order_relaxed);
+        atomic_store_explicit(&local_hess[s][b], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint feat_id = gid.y, wg_in_feat = gid.x;
+    uint per_wg = (num_idx + wg_per_feat - 1) / wg_per_feat;
+    uint start = wg_in_feat * per_wg, end = min(start + per_wg, num_idx);
+    device const uchar* col = features + (uint64_t)feat_id * num_data;
+    uint sub = sg_idx % NUM_SUBHIST;
+    for (uint j = start + tid; j < end; j += tg_sz) {
+        uint row = indices[j];
+        uint bin = (uint)col[row];
+        int g = (int)gh_packed[2 * row];
+        int h = (int)gh_packed[2 * row + 1];
+        atomic_fetch_add_explicit(&local_grad[sub][bin], g, memory_order_relaxed);
+        atomic_fetch_add_explicit(&local_hess[sub][bin], h, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device int32_t* out =
+        partial_hist + ((uint64_t)feat_id * wg_per_feat + wg_in_feat) * NUM_BINS * 2;
+    for (uint b = tid; b < NUM_BINS; b += tg_sz) {
+        int g_s = 0, h_s = 0;
+        for (uint s = 0; s < NUM_SUBHIST; ++s) {
+            g_s += atomic_load_explicit(&local_grad[s][b], memory_order_relaxed);
+            h_s += atomic_load_explicit(&local_hess[s][b], memory_order_relaxed);
+        }
+        out[2 * b + 0] = g_s;
+        out[2 * b + 1] = h_s;
+    }
+}
+
+// Quantized reduce: int32 sum across wg_per_feat dim.
+kernel void histogram_reduce_q32(
+    device const int32_t* partial_hist  [[ buffer(0) ]],
+    device int32_t*       out_hist      [[ buffer(1) ]],
+    constant uint&        wg_per_feat   [[ buffer(2) ]],
+    uint tid [[ thread_position_in_threadgroup ]],
+    uint gid [[ threadgroup_position_in_grid ]])
+{
+    uint feat_id = gid;
+    uint bin = tid;
+    int g = 0, h = 0;
+    for (uint w = 0; w < wg_per_feat; ++w) {
+        device const int32_t* p = partial_hist + ((uint64_t)feat_id * wg_per_feat + w) * NUM_BINS * 2;
+        g += p[2 * bin + 0];
+        h += p[2 * bin + 1];
+    }
+    device int32_t* out = out_hist + (uint64_t)feat_id * NUM_BINS * 2;
+    out[2 * bin + 0] = g;
+    out[2 * bin + 1] = h;
+}
+
 // Indexed variant: only rows whose global index is in `indices[0..num_idx)`
 // contribute. Used for deeper leaves where data_indices is non-null.
 kernel void histogram_partial_indexed(
@@ -300,11 +421,14 @@ struct MetalTreeLearner::MetalState {
 
   // Per-binsize compiled artifacts (idx 0=16-bin, 1=64-bin, 2=256-bin).
   struct PerBinSize {
-    MTL::Library*              library             = nullptr;
-    MTL::ComputePipelineState* pso_partial         = nullptr;
-    MTL::ComputePipelineState* pso_partial_indexed = nullptr;
-    MTL::ComputePipelineState* pso_partial_k2      = nullptr;  // multi-feature variant
-    MTL::ComputePipelineState* pso_reduce          = nullptr;
+    MTL::Library*              library                 = nullptr;
+    MTL::ComputePipelineState* pso_partial             = nullptr;
+    MTL::ComputePipelineState* pso_partial_indexed     = nullptr;
+    MTL::ComputePipelineState* pso_partial_k2          = nullptr;  // multi-feature variant
+    MTL::ComputePipelineState* pso_partial_q32         = nullptr;  // quantized 32-bit
+    MTL::ComputePipelineState* pso_partial_q32_indexed = nullptr;
+    MTL::ComputePipelineState* pso_reduce              = nullptr;
+    MTL::ComputePipelineState* pso_reduce_q32          = nullptr;
   };
   PerBinSize bs16, bs64, bs256;
 
@@ -319,6 +443,11 @@ struct MetalTreeLearner::MetalState {
   MTL::Buffer* idx_buf      = nullptr;  // uint  [num_data]
   MTL::Buffer* partial_buf  = nullptr;  // float [num_features * wg_per_feat * 2*active_bins]
   MTL::Buffer* out_buf      = nullptr;  // float [num_features * 2*active_bins]
+  // Quantized variant buffers (allocated only when use_quantized_grad).
+  MTL::Buffer* gh_packed_buf  = nullptr;  // int8  [2 * num_data] packed grad+hess
+  MTL::Buffer* partial_buf_i32 = nullptr; // int32 [num_features * wg_per_feat * 2*active_bins]
+  MTL::Buffer* out_buf_i32     = nullptr; // int32 [num_features * 2*active_bins]
+  bool quantized_buffers = false;
 
   int num_metal_features = 0;
   int num_data           = 0;
@@ -327,7 +456,8 @@ struct MetalTreeLearner::MetalState {
   static void ReleaseBinsize(PerBinSize* bs) {
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(bs->pso_partial); rel(bs->pso_partial_indexed); rel(bs->pso_partial_k2);
-    rel(bs->pso_reduce);
+    rel(bs->pso_partial_q32); rel(bs->pso_partial_q32_indexed);
+    rel(bs->pso_reduce); rel(bs->pso_reduce_q32);
     rel(bs->library);
   }
 
@@ -335,6 +465,7 @@ struct MetalTreeLearner::MetalState {
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(feat_buf); rel(grad_buf); rel(hess_buf); rel(idx_buf);
     rel(partial_buf); rel(out_buf);
+    rel(gh_packed_buf); rel(partial_buf_i32); rel(out_buf_i32);
     ReleaseBinsize(&bs16); ReleaseBinsize(&bs64); ReleaseBinsize(&bs256);
     rel(queue); rel(device);
   }
@@ -417,11 +548,16 @@ void MetalTreeLearner::InitMetal() {
                            err2 ? err2->localizedDescription()->utf8String() : "(unknown)");
       return p;
     };
-    bs->pso_partial         = make_pso("histogram_partial");
-    bs->pso_partial_indexed = make_pso("histogram_partial_indexed");
-    bs->pso_partial_k2      = make_pso("histogram_partial_k2");
-    bs->pso_reduce          = make_pso("histogram_reduce");
-    return bs->pso_partial && bs->pso_partial_indexed && bs->pso_partial_k2 && bs->pso_reduce;
+    bs->pso_partial             = make_pso("histogram_partial");
+    bs->pso_partial_indexed     = make_pso("histogram_partial_indexed");
+    bs->pso_partial_k2          = make_pso("histogram_partial_k2");
+    bs->pso_partial_q32         = make_pso("histogram_partial_q32");
+    bs->pso_partial_q32_indexed = make_pso("histogram_partial_q32_indexed");
+    bs->pso_reduce              = make_pso("histogram_reduce");
+    bs->pso_reduce_q32          = make_pso("histogram_reduce_q32");
+    return bs->pso_partial && bs->pso_partial_indexed && bs->pso_partial_k2
+        && bs->pso_partial_q32 && bs->pso_partial_q32_indexed
+        && bs->pso_reduce && bs->pso_reduce_q32;
   };
   bool ok = compile_variant(&state_->bs16,  16,  16)
          && compile_variant(&state_->bs64,  64,  8)
@@ -562,6 +698,24 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   // the worst case (all rows in a leaf).
   state_->idx_buf = state_->device->newBuffer((size_t)num_data * sizeof(uint32_t),
                                               MTL::ResourceStorageModeShared);
+  // Quantized buffers when use_quantized_grad is enabled. Same shape as the
+  // float buffers but int32-element-typed.
+  if (config_->use_quantized_grad) {
+    state_->gh_packed_buf = state_->device->newBuffer(
+        (size_t)num_data * 2,    // 2 int8s per row
+        MTL::ResourceStorageModeShared);
+    state_->partial_buf_i32 = state_->device->newBuffer(
+        (size_t)num_features * (size_t)state_->wg_per_feat * state_->active_bins * 2 * sizeof(int32_t),
+        MTL::ResourceStorageModePrivate);
+    state_->out_buf_i32 = state_->device->newBuffer(
+        (size_t)num_features * state_->active_bins * 2 * sizeof(int32_t),
+        MTL::ResourceStorageModeShared);
+    state_->quantized_buffers = true;
+    Log::Info("Metal: quantized int32 buffers allocated (%.1f MB).",
+              ((size_t)num_features * (size_t)state_->wg_per_feat * state_->active_bins * 2 * sizeof(int32_t)
+               + (size_t)num_features * state_->active_bins * 2 * sizeof(int32_t)
+               + (size_t)num_data * 2) / 1048576.0);
+  }
 
   Log::Info("Metal: %d-feature dense buffer materialized (%.1f MB). "
             "wg_per_feat=%d, NUM_BINS=%d.",
@@ -693,21 +847,137 @@ void MetalTreeLearner::RunMetalHistogramIndexed(const data_size_t* data_indices,
   }
 }
 
+void MetalTreeLearner::RunMetalHistogramQ32(data_size_t num_data) {
+  uint32_t nd = (uint32_t)num_data;
+  uint32_t wg = (uint32_t)state_->wg_per_feat;
+  const bool one_wg = (state_->wg_per_feat == 1);
+  MTL::Buffer* partial_dst = one_wg ? state_->out_buf_i32 : state_->partial_buf_i32;
+
+  MTL::CommandBuffer* cb = state_->queue->commandBuffer();
+  MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+  enc->setComputePipelineState(state_->active->pso_partial_q32);
+  enc->setBuffer(state_->feat_buf, 0, 0);
+  enc->setBuffer(state_->gh_packed_buf, 0, 1);
+  enc->setBuffer(partial_dst, 0, 2);
+  enc->setBytes(&nd, sizeof(uint32_t), 3);
+  enc->setBytes(&wg, sizeof(uint32_t), 4);
+  enc->dispatchThreadgroups(
+      MTL::Size::Make(state_->wg_per_feat, state_->num_metal_features, 1),
+      MTL::Size::Make(kThreadsPerGroup, 1, 1));
+  if (!one_wg) {
+    enc->setComputePipelineState(state_->active->pso_reduce_q32);
+    enc->setBuffer(state_->partial_buf_i32, 0, 0);
+    enc->setBuffer(state_->out_buf_i32, 0, 1);
+    enc->setBytes(&wg, sizeof(uint32_t), 2);
+    enc->dispatchThreadgroups(
+        MTL::Size::Make(state_->num_metal_features, 1, 1),
+        MTL::Size::Make(state_->active_bins, 1, 1));
+  }
+  enc->endEncoding();
+  cb->commit();
+  cb->waitUntilCompleted();
+}
+
+void MetalTreeLearner::RunMetalHistogramQ32Indexed(const data_size_t* data_indices,
+                                                   data_size_t num_idx) {
+  static_assert(sizeof(data_size_t) == sizeof(uint32_t),
+                "Metal q32 indexed kernel assumes data_size_t is 32-bit.");
+  std::memcpy(state_->idx_buf->contents(), data_indices,
+              (size_t)num_idx * sizeof(uint32_t));
+  uint32_t nd = (uint32_t)state_->num_data;
+  uint32_t ni = (uint32_t)num_idx;
+  uint32_t wg = (uint32_t)state_->wg_per_feat;
+  const bool one_wg = (state_->wg_per_feat == 1);
+  MTL::Buffer* partial_dst = one_wg ? state_->out_buf_i32 : state_->partial_buf_i32;
+
+  MTL::CommandBuffer* cb = state_->queue->commandBuffer();
+  MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+  enc->setComputePipelineState(state_->active->pso_partial_q32_indexed);
+  enc->setBuffer(state_->feat_buf, 0, 0);
+  enc->setBuffer(state_->gh_packed_buf, 0, 1);
+  enc->setBuffer(partial_dst, 0, 2);
+  enc->setBytes(&nd, sizeof(uint32_t), 3);
+  enc->setBytes(&wg, sizeof(uint32_t), 4);
+  enc->setBuffer(state_->idx_buf, 0, 5);
+  enc->setBytes(&ni, sizeof(uint32_t), 6);
+  enc->dispatchThreadgroups(
+      MTL::Size::Make(state_->wg_per_feat, state_->num_metal_features, 1),
+      MTL::Size::Make(kThreadsPerGroup, 1, 1));
+  if (!one_wg) {
+    enc->setComputePipelineState(state_->active->pso_reduce_q32);
+    enc->setBuffer(state_->partial_buf_i32, 0, 0);
+    enc->setBuffer(state_->out_buf_i32, 0, 1);
+    enc->setBytes(&wg, sizeof(uint32_t), 2);
+    enc->dispatchThreadgroups(
+        MTL::Size::Make(state_->num_metal_features, 1, 1),
+        MTL::Size::Make(state_->active_bins, 1, 1));
+  }
+  enc->endEncoding();
+  cb->commit();
+  cb->waitUntilCompleted();
+}
+
 void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature_used,
                                            bool use_subtract) {
   // Fall back to the CPU path when Metal isn't fully wired or the dataset is
-  // ineligible. Also skip the Metal path entirely when quantized gradients
-  // are in use — Phase 2.1 doesn't handle the int8/int16 layout yet.
-  if (!metal_ready_ || !metal_buffer_ready_ || config_->use_quantized_grad) {
-    // Log the *runtime* fallback reason once per call (Metal init succeeded
-    // but per-call gating kicked in). Only logged at Debug; cheap.
-    static thread_local bool warned_quantized = false;
-    if (config_->use_quantized_grad && metal_ready_ && !warned_quantized) {
-      Log::Info("Metal: use_quantized_grad=true is not yet supported on Metal; "
-                "delegating histogram construction to CPU for this run.");
-      warned_quantized = true;
-    }
+  // ineligible.
+  if (!metal_ready_ || !metal_buffer_ready_) {
     SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+    return;
+  }
+
+  // Quantized-gradient path: int8 grad+hess, int32 histograms. Only the
+  // 32-bit-per-bin case is Metal-accelerated; for 16-bit leaves (small
+  // leaves), fall back to the CPU path for this call. Verify mode also
+  // falls back since it requires float histograms for comparison.
+  if (config_->use_quantized_grad) {
+    if (g_verify.enabled || !state_->quantized_buffers) {
+      SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+      return;
+    }
+    const uint8_t smaller_bits = gradient_discretizer_->GetHistBitsInLeaf<false>(
+        smaller_leaf_splits_->leaf_index());
+    if (smaller_bits != 32) {
+      // 16-bit leaf — Metal q32 doesn't apply; delegate.
+      SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+      return;
+    }
+    Common::FunctionTimer fun_timer_q("MetalTreeLearner::ConstructHistograms[q32]",
+                                       global_timer);
+
+    // Stage the int8 packed gradients/hessians into the GPU buffer.
+    const int8_t* gh = gradient_discretizer_->discretized_gradients_and_hessians();
+    std::memcpy(state_->gh_packed_buf->contents(), gh,
+                (size_t)state_->num_data * 2);
+
+    const data_size_t leaf_num_data_q = smaller_leaf_splits_->num_data_in_leaf();
+    const data_size_t* data_indices_q = smaller_leaf_splits_->data_indices();
+    if (data_indices_q == nullptr || leaf_num_data_q == state_->num_data) {
+      RunMetalHistogramQ32(state_->num_data);
+    } else {
+      RunMetalHistogramQ32Indexed(data_indices_q, leaf_num_data_q);
+    }
+
+    // Write back as int32 to RawDataInt32 — per-feature.
+    const int32_t* metal_hist_i32 =
+        static_cast<const int32_t*>(state_->out_buf_i32->contents());
+    const int num_features = train_data_->num_features();
+    for (int f = 0; f < num_features; ++f) {
+      if (!is_feature_used[f]) continue;
+      const int num_bin = per_feature_num_bin_[f];
+      const int offset  = per_feature_offset_[f];
+      int32_t* dst = smaller_leaf_histogram_array_[f].RawDataInt32();
+      const int32_t* src = metal_hist_i32 + (size_t)f * state_->active_bins * 2;
+      for (int b = offset; b < num_bin; ++b) {
+        dst[2 * (b - offset) + 0] = src[2 * b + 0];
+        dst[2 * (b - offset) + 1] = src[2 * b + 1];
+      }
+    }
+    // Larger leaf is computed via subtract in the caller when use_subtract=true;
+    // otherwise delegate to CPU (we don't yet build the larger leaf in q32 mode).
+    if (larger_leaf_histogram_array_ != nullptr && !use_subtract) {
+      SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+    }
     return;
   }
 
