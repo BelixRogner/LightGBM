@@ -55,13 +55,14 @@ class MetalTreeLearner : public SerialTreeLearner {
   struct MetalState;
   std::unique_ptr<MetalState> state_;
 
-  /*! \brief Feature groups eligible for Metal acceleration (dense, 256-bin). */
-  std::vector<int> metal_feature_groups_;
+  /*! \brief True after BuildDenseFeatureBuffer has materialized this dataset's
+   * feature buffer; gates the Metal path in ConstructHistograms. */
+  bool metal_buffer_ready_ = false;
   /*! \brief Cached per-feature bin counts (avoids virtual calls in hot write-back loop). */
   std::vector<int> per_feature_num_bin_;
   /*! \brief Cached per-feature offset (0 or 1 depending on most-frequent bin). */
   std::vector<int> per_feature_offset_;
-  /*! \brief True when a Metal pipeline is fully ready for histogram construction. */
+  /*! \brief True when the Metal device + kernels + queue are ready. */
   bool metal_ready_ = false;
 };
 

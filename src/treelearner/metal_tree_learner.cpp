@@ -270,7 +270,7 @@ void MetalTreeLearner::ResetTrainingDataInner(const Dataset* train_data,
                                             reset_multi_val_bin);
   // Force a rebuild of the dense feature buffer next time around.
   metal_ready_ = false;
-  metal_feature_groups_.clear();
+  metal_buffer_ready_ = false;
 }
 
 void MetalTreeLearner::InitMetal() {
@@ -398,11 +398,9 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   }
 
   const data_size_t num_data = train_data_->num_data();
-  metal_feature_groups_.resize(num_features);
   per_feature_num_bin_.resize(num_features);
   per_feature_offset_.resize(num_features);
   for (int f = 0; f < num_features; ++f) {
-    metal_feature_groups_[f] = f;
     per_feature_num_bin_[f]  = train_data_->FeatureNumBin(f);
     per_feature_offset_[f]   =
         (train_data_->FeatureBinMapper(f)->GetMostFreqBin() == 0) ? 1 : 0;
@@ -459,6 +457,7 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
             "wg_per_feat=%d, NUM_BINS=%d.",
             num_features, feat_bytes / 1048576.0, state_->wg_per_feat,
             state_->active_bins);
+  metal_buffer_ready_ = true;
   return true;
 }
 
@@ -467,7 +466,7 @@ void MetalTreeLearner::BeforeTrain() {
   // Gradients/hessians are set once per tree by the caller before BeforeTrain.
   // Copy them into the shared Metal buffers exactly once here so the per-leaf
   // histogram dispatch doesn't re-pay the memcpy.
-  if (metal_ready_ && !metal_feature_groups_.empty()) {
+  if (metal_ready_ && !!metal_buffer_ready_) {
     std::memcpy(state_->grad_buf->contents(), gradients_,
                 (size_t)state_->num_data * sizeof(score_t));
     std::memcpy(state_->hess_buf->contents(), hessians_,
@@ -582,7 +581,7 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
   // Fall back to the CPU path when Metal isn't fully wired or the dataset is
   // ineligible. Also skip the Metal path entirely when quantized gradients
   // are in use — Phase 2.1 doesn't handle the int8/int16 layout yet.
-  if (!metal_ready_ || metal_feature_groups_.empty() || config_->use_quantized_grad) {
+  if (!metal_ready_ || !metal_buffer_ready_ || config_->use_quantized_grad) {
     // Log the *runtime* fallback reason once per call (Metal init succeeded
     // but per-call gating kicked in). Only logged at Debug; cheap.
     static thread_local bool warned_quantized = false;
