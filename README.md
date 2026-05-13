@@ -17,7 +17,7 @@ What's different from upstream LightGBM
 - **CUDA correctness fixes** that have been slow to land upstream — int32 overflow in dense histogram offsets, half-sized discretizer buffer, per-tree CUDA stream leak, missing `min_data_per_group` in CUDA categorical kernels, multiple quantized-grad bugs.
 - **Per-tree feature-fraction compact view.** At `colsample_bytree = 0.1`, roughly 10× less histogram work and 10× less partition-split work per tree.
 - **Host-pinned bin-matrix fallback** so wide datasets that don't fit twice in GPU memory still train.
-- **Metal backend** (Apple silicon, M-series) — `device_type=metal` runs histogram construction on the integrated GPU. ~1.1–1.4× end-to-end training speedup on M4 Pro, bit-exact AUC vs CPU.
+- **Metal backend** (Apple silicon, M-series) — `device_type=metal` runs histogram construction on the integrated GPU. ~1.1–1.4× end-to-end training speedup on M4 Pro, bit-exact AUC vs CPU. Supports the standard binary / multiclass / regression / ranking objectives, quantized gradients (32-bit case), bagging, feature_fraction, categorical features, monotone constraints, early stopping, init_model, model save/load. See the [Metal section](#building-with-the-metal-backend-macos-apple-silicon) below.
 - **Open contribution policy.** See [CONTRIBUTING.md](CONTRIBUTING.md). Human and AI contributors are welcome on the same terms.
 
 Install / build
