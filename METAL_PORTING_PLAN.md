@@ -15,8 +15,9 @@ on Apple silicon can use the GPU. The OpenCL backend stays untouched.
   MIN_LEAF_ROWS,K_FEATS,OMP_WRITEBACK_THRESHOLD,TIMING}`)
 - ⚠️ Multi-feature kernel (K=2) implemented but not net-faster on M4 Pro;
   opt-in only via `LIGHTGBM_METAL_K_FEATS=2`
-- ❌ Quantized gradients (`use_quantized_grad=true`) — clean CPU fallback
-  with logged reason, but no Metal acceleration
+- ✅ Quantized gradients (`use_quantized_grad=true`) — Metal-accelerated for
+  the 32-bit-histogram case via dedicated q32 kernels; 16-bit-histogram
+  leaves still fall back to CPU. Bit-exact AUC vs CPU on smoke tests.
 - ❌ Sparse / multi-val groups — clean CPU fallback
 
 ## Scope (Phase 2 target)

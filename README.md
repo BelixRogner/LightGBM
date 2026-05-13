@@ -73,7 +73,8 @@ fall back to CPU):
 - Dense (non-multi-val) features
 - ≤ 256 bins per feature
 - ≥ 32 features (override via `LIGHTGBM_METAL_MIN_FEATURES=N`)
-- `use_quantized_grad = false`
+- `use_quantized_grad` is supported for 32-bit-histogram leaves (typically
+  the root and early-depth leaves); 16-bit-histogram leaves fall back to CPU
 
 The 16/64/256-bin kernel variants are compiled and selected automatically
 based on each dataset's `max_bin`.
