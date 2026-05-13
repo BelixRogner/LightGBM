@@ -89,6 +89,9 @@ AUC / accuracy / F1 agreement within 2% absolute tolerance.
   falls back to CPU (dispatch overhead exceeds the kernel win on narrow data).
 - `LIGHTGBM_METAL_WG_PER_FEAT=N` (default auto): override the workgroups-
   per-feature tiling. Auto-tunes to target ~512 threadgroups.
+- `LIGHTGBM_METAL_MIN_LEAF_ROWS=N` (default 0, opt-in): delegate
+  ConstructHistograms to CPU when the current leaf has fewer than N rows.
+  Useful for highly skewed trees where most rows end up in shallow leaves.
 - `LIGHTGBM_METAL_TIMING=1`: print per-call timing breakdown at process
   exit (idx_copy / dispatch / gpu_only / writeback).
 
