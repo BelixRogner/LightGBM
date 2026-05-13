@@ -9,10 +9,13 @@ on Apple silicon can use the GPU. The OpenCL backend stays untouched.
 - ✅ 1.09–1.37× end-to-end training speedup on M4 Pro
 - ✅ Multi-binsize kernel dispatch (16 / 64 / 256), auto-selected from data
 - ✅ Indexed-kernel deeper-leaf path; multi-feature-group support
-- ✅ 30 Python parity tests + 3 cpp gtests, all passing
+- ✅ 44 Python parity tests + 3 cpp gtests, all passing
 - ✅ CI: `.github/workflows/metal.yml` on macos-latest (Apple silicon runners)
+- ✅ Verify mode (`LIGHTGBM_METAL_VERIFY=1`) — runs CPU + Metal side-by-side
+  and reports max-rel drift at process exit
 - ✅ Comprehensive env-var tuning (`LIGHTGBM_METAL_{MIN_FEATURES,WG_PER_FEAT,
-  MIN_LEAF_ROWS,K_FEATS,OMP_WRITEBACK_THRESHOLD,TIMING}`)
+  MIN_LEAF_ROWS,K_FEATS,OMP_WRITEBACK_THRESHOLD,TIMING,VERIFY,
+  FORCE_MULTI_VAL}`)
 - ⚠️ Multi-feature kernel (K=2) implemented but not net-faster on M4 Pro;
   opt-in only via `LIGHTGBM_METAL_K_FEATS=2`
 - ✅ Quantized gradients (`use_quantized_grad=true`) — Metal-accelerated for
@@ -24,6 +27,10 @@ on Apple silicon can use the GPU. The OpenCL backend stays untouched.
   workloads (we materialize the dense column buffer and pay for zeros).
   Default skips multi-val groups; opt in via
   `LIGHTGBM_METAL_FORCE_MULTI_VAL=1`.
+- ⚠️ `min_data_in_leaf<=2` + `min_sum_hessian_in_leaf=0`: atomic-ordering
+  noise in Metal histograms can flip a 1-row leaf's derived count to 0,
+  tripping LightGBM's `left_count > 0` assertion. Defaults
+  (`min_data_in_leaf=20`) are safe.
 
 ## Scope (Phase 2 target)
 
