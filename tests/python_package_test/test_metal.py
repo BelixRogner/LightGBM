@@ -290,6 +290,41 @@ def test_quantile_regression_parity():
     assert rel < 0.05, (cpu_p75, metal_p75)
 
 
+def test_sparse_input_falls_back_cleanly():
+    """Sparse / multi-val datasets aren't supported by the Metal kernels yet;
+    they must transparently fall back to the CPU path without crashing or
+    producing degraded results."""
+    from scipy.sparse import csr_matrix
+    X, y = make_classification(
+        n_samples=2_000, n_features=128, n_informative=20, random_state=15,
+    )
+    X[np.abs(X) < 0.8] = 0  # ~60% zeros
+    X_sparse = csr_matrix(X)
+    X_train_s, X_test_s, y_train, y_test = train_test_split(
+        X_sparse, y, test_size=0.25, random_state=15
+    )
+
+    cpu_ds = lgb.Dataset(X_train_s, y_train)
+    cpu_bst = lgb.train({"objective": "binary", "num_leaves": 15, "verbosity": -1,
+                         "device_type": "cpu", "deterministic": True, "seed": 0},
+                        cpu_ds, num_boost_round=30)
+    metal_ds = lgb.Dataset(X_train_s, y_train)
+    metal_bst = lgb.train({"objective": "binary", "num_leaves": 15, "verbosity": -1,
+                           "device_type": "metal", "deterministic": True, "seed": 0},
+                          metal_ds, num_boost_round=30)
+
+    cpu_pred = cpu_bst.predict(X_test_s)
+    metal_pred = metal_bst.predict(X_test_s)
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    # Same code path (Metal falls back to SerialTreeLearner). Tolerate a
+    # small drift in case of any incidental non-determinism in shared CPU
+    # paths; the important assertion is that AUC is close.
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.01), (cpu_auc, metal_auc)
+    # Sanity: fallback model is still useful (sparse data IS informative).
+    assert metal_auc > 0.85
+
+
 def test_large_scale_drift():
     """Stress test with 100k rows + 128 features + 100 trees. Each
     histogram cell accumulates ~800 floats; atomic-ordering drift
