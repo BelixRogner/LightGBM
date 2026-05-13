@@ -1,15 +1,23 @@
 """Compare CPU vs Metal training time on a meaningfully-sized dataset.
 
 Usage:
-    python tools/metal_bench/train_bench.py
+    python tools/metal_bench/train_bench.py            # human-readable
+    python tools/metal_bench/train_bench.py --csv      # CSV output
 """
 
+import sys
 import time
 
 import numpy as np
 from sklearn.datasets import make_classification
 
 import lightgbm as lgb
+
+
+CSV_MODE = "--csv" in sys.argv
+
+if CSV_MODE:
+    print("num_data,num_features,num_iterations,device,seconds,auc")
 
 
 def bench(num_samples: int, num_features: int, num_iterations: int = 50) -> None:
@@ -20,7 +28,8 @@ def bench(num_samples: int, num_features: int, num_iterations: int = 50) -> None
         n_redundant=max(num_features // 8, 2),
         random_state=0,
     )
-    print(f"\n=== {num_samples:,} rows x {num_features} features, {num_iterations} iters ===")
+    if not CSV_MODE:
+        print(f"\n=== {num_samples:,} rows x {num_features} features, {num_iterations} iters ===")
 
     base = dict(
         objective="binary",
@@ -43,7 +52,10 @@ def bench(num_samples: int, num_features: int, num_iterations: int = 50) -> None
         pred = bst.predict(X)
         from sklearn.metrics import roc_auc_score
         auc = roc_auc_score(y, pred)
-        print(f"  {device:>5}: {elapsed:6.3f}s  AUC={auc:.6f}")
+        if CSV_MODE:
+            print(f"{num_samples},{num_features},{num_iterations},{device},{elapsed:.4f},{auc:.6f}")
+        else:
+            print(f"  {device:>5}: {elapsed:6.3f}s  AUC={auc:.6f}")
 
 
 if __name__ == "__main__":
