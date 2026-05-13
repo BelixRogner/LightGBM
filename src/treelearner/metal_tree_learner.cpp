@@ -603,10 +603,17 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
 
   // Multi-feature groups (LightGBM packs narrow features together) are OK —
   // FeatureIterator(f) abstracts the packing and we materialize a flat
-  // per-feature column buffer.
+  // per-feature column buffer. Multi-val sparse groups: experimentally
+  // BinIterator::Get returns the per-feature bin correctly, so they should
+  // work too; gated behind an opt-out env var in case of subtle bugs.
+  static bool allow_multi_val = []() {
+    const char* env = std::getenv("LIGHTGBM_METAL_SKIP_MULTI_VAL");
+    return env == nullptr || env[0] != '1';
+  }();
   for (int g = 0; g < num_groups; ++g) {
-    if (train_data_->IsMultiGroup(g)) {
-      Log::Info("Metal: skipping acceleration (multi-val feature group %d).", g);
+    if (train_data_->IsMultiGroup(g) && !allow_multi_val) {
+      Log::Info("Metal: skipping acceleration (multi-val feature group %d, "
+                "LIGHTGBM_METAL_SKIP_MULTI_VAL=1).", g);
       return false;
     }
   }

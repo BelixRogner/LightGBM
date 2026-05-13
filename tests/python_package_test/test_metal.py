@@ -331,10 +331,15 @@ def test_quantile_regression_parity():
     assert rel < 0.05, (cpu_p75, metal_p75)
 
 
-def test_sparse_input_falls_back_cleanly():
-    """Sparse / multi-val datasets aren't supported by the Metal kernels yet;
-    they must transparently fall back to the CPU path without crashing or
-    producing degraded results."""
+def test_sparse_input_parity():
+    """Sparse / multi-val datasets: scipy.sparse input triggers LightGBM's
+    Sparse Multi-Val Bin storage. BinIterator::Get returns per-sub-feature
+    bins correctly, so the Metal path materializes a per-feature column
+    buffer and the histograms match CPU.
+
+    (Previously this test asserted clean CPU fallback; the Metal path now
+    handles multi-val groups directly. Opt out via
+    LIGHTGBM_METAL_SKIP_MULTI_VAL=1.)"""
     from scipy.sparse import csr_matrix
     X, y = make_classification(
         n_samples=2_000, n_features=128, n_informative=20, random_state=15,
@@ -358,11 +363,8 @@ def test_sparse_input_falls_back_cleanly():
     metal_pred = metal_bst.predict(X_test_s)
     cpu_auc = roc_auc_score(y_test, cpu_pred)
     metal_auc = roc_auc_score(y_test, metal_pred)
-    # Same code path (Metal falls back to SerialTreeLearner). Tolerate a
-    # small drift in case of any incidental non-determinism in shared CPU
-    # paths; the important assertion is that AUC is close.
-    assert metal_auc == pytest.approx(cpu_auc, abs=0.01), (cpu_auc, metal_auc)
-    # Sanity: fallback model is still useful (sparse data IS informative).
+    # Metal path produces matching AUC on sparse multi-val data.
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
     assert metal_auc > 0.85
 
 

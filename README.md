@@ -136,6 +136,9 @@ max_bin boundary, 1024-feature wide, and 100k-row drift stress. Run via
   alongside Metal, compares element-wise, logs drift > 10%, and uses
   CPU values for splits. ~2× slower; catches kernel regressions during
   development.
+- `LIGHTGBM_METAL_SKIP_MULTI_VAL=1`: opt out of Metal acceleration on
+  sparse-multi-val feature groups (falls back to CPU). Default is
+  Metal-accelerate since the path produces matching AUC.
 
 Documentation
 -------------
