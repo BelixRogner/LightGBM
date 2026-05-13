@@ -9,7 +9,7 @@ on Apple silicon can use the GPU. The OpenCL backend stays untouched.
 - ✅ 1.09–1.37× end-to-end training speedup on M4 Pro
 - ✅ Multi-binsize kernel dispatch (16 / 64 / 256), auto-selected from data
 - ✅ Indexed-kernel deeper-leaf path; multi-feature-group support
-- ✅ 44 Python parity tests + 3 cpp gtests, all passing
+- ✅ 45 Python parity tests + 3 cpp gtests, all passing
 - ✅ CI: `.github/workflows/metal.yml` on macos-latest (Apple silicon runners)
 - ✅ Verify mode (`LIGHTGBM_METAL_VERIFY=1`) — runs CPU + Metal side-by-side
   and reports max-rel drift at process exit
