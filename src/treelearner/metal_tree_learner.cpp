@@ -601,6 +601,20 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
   const data_size_t leaf_num_data = smaller_leaf_splits_->num_data_in_leaf();
   const data_size_t* data_indices = smaller_leaf_splits_->data_indices();
 
+  // No leaf-size threshold: empirically a 600us Metal dispatch beats CPU
+  // even for very small leaves (depth-N leaves of a num_data row split
+  // typically still have num_data/2^N rows, and CPU writes to many feature
+  // histograms which adds up). Users can override via
+  // LIGHTGBM_METAL_MIN_LEAF_ROWS=N to opt out at large leaf sizes.
+  static int small_leaf_threshold = []() {
+    const char* env = std::getenv("LIGHTGBM_METAL_MIN_LEAF_ROWS");
+    return env ? std::max(0, std::atoi(env)) : 0;
+  }();
+  if (small_leaf_threshold > 0 && leaf_num_data < small_leaf_threshold) {
+    SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+    return;
+  }
+
   auto t_disp0 = g_timings.enabled ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point();
   if (data_indices == nullptr || leaf_num_data == state_->num_data) {
