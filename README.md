@@ -84,6 +84,14 @@ logloss). On larger datasets, atomic-ordering rounding can produce sub-ULP
 drift; the parity tests in `tests/python_package_test/test_metal.py` assert
 AUC / accuracy / F1 agreement within 2% absolute tolerance.
 
+**Environment variables:**
+- `LIGHTGBM_METAL_MIN_FEATURES=N` (default 96): below N features, Metal
+  falls back to CPU (dispatch overhead exceeds the kernel win on narrow data).
+- `LIGHTGBM_METAL_WG_PER_FEAT=N` (default auto): override the workgroups-
+  per-feature tiling. Auto-tunes to target ~512 threadgroups.
+- `LIGHTGBM_METAL_TIMING=1`: print per-call timing breakdown at process
+  exit (idx_copy / dispatch / gpu_only / writeback).
+
 Documentation
 -------------
 
