@@ -139,10 +139,18 @@ Inventory, plan, branch (`metal-backend`).
 
 ### Phase 2.2 — parity tests — DONE
 
-- `tests/python_package_test/test_metal.py`: 4 tests (binary, multiclass,
-  regression, smoke) — all pass.
-- `tests/cpp_tests/test_metal_histogram.cpp`: 2 gtests, including a bit-exact
-  small-scale case and a noise-tolerant 100k×32 case.
+- `tests/python_package_test/test_metal.py`: 27 tests covering binary,
+  multiclass, regression, lambdarank, quantile, categorical features,
+  bagging, feature_fraction, L1/L2 regularization, monotone constraints,
+  multi-feature groups, early stopping, init_model (continued training),
+  cross-device model save/load, sparse-input + quantized-grad fallbacks,
+  multi-model in same process, env-var overrides, max_bin boundary,
+  1024-feature wide, force_col_wise, single-iteration, realistic
+  production config (bagging+feature_fraction+early_stop), 100k-row
+  drift stress, and a smoke test.
+- `tests/cpp_tests/test_metal_histogram.cpp`: 3 gtests covering the
+  un-indexed kernel (small-scale bit-exact + noisy 100k×32) and the
+  indexed kernel (50k random subset).
 - `build-python.sh --metal` flag forwards `USE_METAL=ON` and bundles metal-cpp
   into the isolated source dir.
 
