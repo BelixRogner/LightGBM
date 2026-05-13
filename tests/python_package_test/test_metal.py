@@ -268,6 +268,28 @@ def test_binary_classification_multifeature_group_parity():
     assert metal_auc > 0.7
 
 
+def test_quantile_regression_parity():
+    """quantile objective produces non-trivial gradient/hessian patterns
+    different from L2. Verifies the Metal path doesn't make assumptions
+    about gradient shape."""
+    X, y = make_regression(
+        n_samples=3_000, n_features=48, noise=2.0, random_state=14,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=14
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "quantile", "alpha": 0.75, "num_leaves": 31,
+         "learning_rate": 0.1},
+        X_train, y_train, X_test, y_test, num_rounds=40,
+    )
+    # quantile loss isn't symmetric; use a quantile-aware tolerance.
+    cpu_p75  = np.quantile(np.abs(y_test - cpu_pred), 0.75)
+    metal_p75 = np.quantile(np.abs(y_test - metal_pred), 0.75)
+    rel = abs(metal_p75 - cpu_p75) / max(cpu_p75, 1e-6)
+    assert rel < 0.05, (cpu_p75, metal_p75)
+
+
 def test_metal_init_smoke():
     """Smoke test: Metal device initializes and produces a non-degenerate model."""
     X, y = make_classification(n_samples=500, n_features=16, random_state=3)
