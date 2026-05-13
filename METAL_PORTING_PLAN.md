@@ -113,42 +113,85 @@ opts->setPreprocessorMacros(macros);
 auto lib = device->newLibrary(src_nsstring, opts, &err);
 ```
 
-## Phase-by-phase work
+## Phase-by-phase work — status
 
-### Phase 0 (this doc) — DONE
+### Phase 0 — DONE
 
-Inventory, plan, branch.
+Inventory, plan, branch (`metal-backend`).
 
-### Phase 1 — standalone kernel benchmark
+### Phase 1 — standalone kernel benchmark — DONE
 
-Build a single-file harness:
+- `tools/metal_bench/main.cpp` self-contained Metal-vs-CPU histogram bench.
+- Tuned with sub-histograms (`NUM_SUBHIST=4`) and workgroups-per-feature tiling.
+- Results on Apple M4 Pro: **2.2–3.0× speedup** consistently across the
+  workload range (see `tools/metal_bench/RESULTS.md`).
 
-- `tools/metal_bench/main.cpp` + `histogram256.metal`
-- Generate synthetic feature/gradient/hessian data (e.g. 1M rows × 256 dense
-  features, 256 bins).
-- Run both: (a) Metal histogram kernel on M-series GPU; (b) the LightGBM CPU
-  histogram path (extracted from `feature_histogram.cpp`).
-- Report per-iteration ms.
-- **Go/no-go gate**: if Metal < 1.5× CPU, surface to user before Phase 2.
+### Phase 2.0 — backend plumbing — DONE
 
-### Phase 2 — full integration
+- `external_libs/metal-cpp/` vendored.
+- CMake `USE_METAL` option, Metal/Foundation/QuartzCore framework links,
+  `-std=c++17` for `metal_tree_learner.cpp`.
+- `MetalTreeLearner` subclasses `SerialTreeLearner`. `Init()` compiles MSL and
+  builds compute pipeline states.
+- `device_type="metal"` accepted by `Config` and routed in `CreateTreeLearner`.
+- Smoke-tested: end-to-end build, `lightgbm config=... device_type=metal` runs
+  to completion and produces bit-identical AUC/log-loss to CPU (delegation).
 
-1. Vendor `metal-cpp` into `external_libs/metal-cpp/` (Apple's header bundle).
-2. Add CMake `USE_METAL` option + APPLE-only link flags.
-3. Port `histogram{16,64,256}.cl` → `.metal`.
-4. Write `metal_tree_learner.{h,cpp}` mirroring the OpenCL host wrapper.
-5. Wire `device_type=metal` in `tree_learner.cpp`.
-6. End-to-end smoke test: train on a small dataset, compare against CPU output
-   for numerical agreement (tolerate ULP-level drift in atomics order).
+### Phase 2.2 — parity tests — DONE
 
-### Phase 3 — tests, bindings, docs
+- `tests/python_package_test/test_metal.py`: 4 tests (binary, multiclass,
+  regression, smoke) — all pass.
+- `tests/cpp_tests/test_metal_histogram.cpp`: 2 gtests, including a bit-exact
+  small-scale case and a noise-tolerant 100k×32 case.
+- `build-python.sh --metal` flag forwards `USE_METAL=ON` and bundles metal-cpp
+  into the isolated source dir.
 
-- Unit tests under `tests/` (likely `tests/cpp_tests/`) for kernel correctness
-  (Metal vs CPU histogram on fixed input).
-- Python wheel build flag (`build-python.sh`): `--metal`.
-- README section + `docs/Installation-Guide.rst` macOS-Metal subsection.
-- CI: GitHub Actions has `macos-14`/`macos-15` runners with Apple silicon —
-  add a job that builds with `USE_METAL=ON` and runs the kernel test.
+### Phase 2.1 — actual Metal acceleration — IN PROGRESS (next coding work)
+
+Wire the Metal kernel into `MetalTreeLearner::ConstructHistograms` so the
+device actually does work. Strategy:
+
+1. **Eligibility check at `Init`**: a dataset is Metal-eligible if
+   - `!config_->use_quantized_grad` (Phase 2.1 doesn't handle int8/int16)
+   - Each feature group has exactly 1 feature (no Feature4 packing yet)
+   - All features have `≤ 256` bins
+   - No multi-val / sparse features in those groups
+   Store the list of eligible feature indices in `metal_feature_groups_`.
+
+2. **Feature materialization** (once, in `Init` after `SerialTreeLearner::Init`):
+   for each eligible feature `f`, iterate `Dataset::FeatureIterator(f)` and pack
+   bin indices into a single `uchar[num_eligible × num_data]` device buffer.
+   Stored in `MetalState::feat_buf`.
+
+3. **`ConstructHistograms` override**:
+   a. If not eligible → delegate to `SerialTreeLearner::ConstructHistograms`.
+   b. Compute ordered gradients/hessians for the smaller leaf via the same
+      logic SerialTreeLearner uses (data_indices reorder).
+   c. Copy ordered g/h into shared Metal buffers (zero-copy on Apple silicon).
+   d. Dispatch `histogram_partial` + `histogram_reduce`.
+   e. For each eligible feature `f`, write Metal output into
+      `smaller_leaf_histogram_array_[0].RawData() - kHistOffset + 2*GroupBinBoundary(f)`.
+   f. For non-eligible features, call the CPU path on just those.
+   g. Larger leaf: use subtract trick (already in base class).
+
+4. **Bin-size selection**: pick which of `histogram{16,64,256}` kernels to
+   dispatch based on `max_num_bin` across eligible features. Saves threadgroup
+   memory at low bin counts. (Kernel sources already in `src/treelearner/metal/`.)
+
+5. **Verification mode** (env `LIGHTGBM_METAL_VERIFY=1`): run both CPU and
+   Metal, assert ULP-level agreement, log any drift. Catches kernel regressions
+   immediately during development.
+
+### Phase 3 — beyond histograms — FUTURE
+
+- Multi-feature-group packing (Feature4-style `uchar4` layout), matching the
+  OpenCL backend's full perf profile.
+- Sparse / multi-val feature handling.
+- Quantized gradient/hessian path (`use_quantized_grad=true`).
+- `MTL::BinaryArchive` for offline shader caching — skip MSL compilation on
+  every process start.
+- SIMD-group reductions for further atomic-contention reduction.
+- CI: GitHub Actions `macos-14`/`macos-15` runners with `USE_METAL=ON`.
 
 ## Risks / known unknowns
 
