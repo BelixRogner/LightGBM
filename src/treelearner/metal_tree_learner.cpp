@@ -608,10 +608,13 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   // materialization loses CPU's sparse-optimized path. Benchmarks show CPU
   // wins ~1.5x on sparse data, so by default we skip multi-val groups and
   // delegate to the CPU path. Opt in via LIGHTGBM_METAL_FORCE_MULTI_VAL=1.
-  static bool force_multi_val = []() {
-    const char* env = std::getenv("LIGHTGBM_METAL_FORCE_MULTI_VAL");
-    return env != nullptr && env[0] == '1';
-  }();
+  // Read the env var fresh on each BuildDenseFeatureBuffer (rather than
+  // statically once at process start), so tests can toggle it between
+  // training runs in the same process.
+  bool force_multi_val = false;
+  if (const char* env = std::getenv("LIGHTGBM_METAL_FORCE_MULTI_VAL")) {
+    if (env[0] == '1') force_multi_val = true;
+  }
   for (int g = 0; g < num_groups; ++g) {
     if (train_data_->IsMultiGroup(g) && !force_multi_val) {
       Log::Info("Metal: skipping acceleration (multi-val feature group %d; "
