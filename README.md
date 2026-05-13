@@ -122,6 +122,10 @@ max_bin boundary, 1024-feature wide, and 100k-row drift stress. Run via
   with OpenMP. Below the threshold the loop runs single-threaded.
 - `LIGHTGBM_METAL_TIMING=1`: print per-call timing breakdown at process
   exit (idx_copy / dispatch / gpu_only / writeback).
+- `LIGHTGBM_METAL_VERIFY=1`: differential mode. Runs CPU histograms
+  alongside Metal, compares element-wise, logs drift > 10%, and uses
+  CPU values for splits. ~2× slower; catches kernel regressions during
+  development.
 
 Documentation
 -------------
