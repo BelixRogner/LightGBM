@@ -578,9 +578,11 @@ void MetalTreeLearner::TeardownMetal() {
 }
 
 bool MetalTreeLearner::BuildDenseFeatureBuffer() {
-  // Phase 2.1: a dataset is "Metal-eligible" if every feature group is a
-  // single non-multi-val feature with <= NUM_BINS bins. For these we
-  // materialize a packed [num_features × num_data] uchar buffer once.
+  // Eligibility check for the Metal histogram path. Multi-feature groups
+  // and multi-val (sparse) groups are also supported (the latter opt-in via
+  // LIGHTGBM_METAL_FORCE_MULTI_VAL=1 since CPU's sparse path is typically
+  // faster). For all eligible features we materialize a packed
+  // [num_features × num_data] uchar buffer once at Init.
   const int num_groups   = train_data_->num_feature_groups();
   const int num_features = train_data_->num_features();
 
