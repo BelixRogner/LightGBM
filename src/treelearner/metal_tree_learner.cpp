@@ -29,7 +29,7 @@ namespace LightGBM {
 namespace {
 
 constexpr int kThreadsPerGroup = 256;
-constexpr int kNumBins         = 256;
+constexpr int kMaxNumBins      = 256;
 
 // Inlined Metal kernel source. Kept in sync with src/treelearner/metal/histogram256.metal;
 // a regression test verifies the two strings match.
@@ -183,29 +183,43 @@ kernel void histogram_partial_indexed(
 struct MetalTreeLearner::MetalState {
   MTL::Device*               device  = nullptr;
   MTL::CommandQueue*         queue   = nullptr;
-  MTL::Library*              library = nullptr;
-  MTL::ComputePipelineState* pso_partial         = nullptr;
-  MTL::ComputePipelineState* pso_partial_indexed = nullptr;
-  MTL::ComputePipelineState* pso_reduce          = nullptr;
+
+  // Per-binsize compiled artifacts (idx 0=16-bin, 1=64-bin, 2=256-bin).
+  struct PerBinSize {
+    MTL::Library*              library             = nullptr;
+    MTL::ComputePipelineState* pso_partial         = nullptr;
+    MTL::ComputePipelineState* pso_partial_indexed = nullptr;
+    MTL::ComputePipelineState* pso_reduce          = nullptr;
+  };
+  PerBinSize bs16, bs64, bs256;
+
+  PerBinSize* active = nullptr;   // chosen at BuildDenseFeatureBuffer based on max_num_bin
+  int active_bins = 0;            // 16 / 64 / 256
 
   // Persistent device-resident buffers (rebuilt on training-data changes).
   MTL::Buffer* feat_buf     = nullptr;  // uchar [num_metal_features * num_data]
   MTL::Buffer* grad_buf     = nullptr;  // float [num_data]
   MTL::Buffer* hess_buf     = nullptr;  // float [num_data]
-  MTL::Buffer* idx_buf      = nullptr;  // uint  [num_data], reused across deeper-leaf calls
-  MTL::Buffer* partial_buf  = nullptr;  // float [num_metal_features * wg_per_feat * 2*NUM_BINS]
-  MTL::Buffer* out_buf      = nullptr;  // float [num_metal_features * 2*NUM_BINS]
+  MTL::Buffer* idx_buf      = nullptr;  // uint  [num_data]
+  MTL::Buffer* partial_buf  = nullptr;  // float [num_features * wg_per_feat * 2*active_bins]
+  MTL::Buffer* out_buf      = nullptr;  // float [num_features * 2*active_bins]
 
   int num_metal_features = 0;
   int num_data           = 0;
   int wg_per_feat        = 1;
 
+  static void ReleaseBinsize(PerBinSize* bs) {
+    auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
+    rel(bs->pso_partial); rel(bs->pso_partial_indexed); rel(bs->pso_reduce);
+    rel(bs->library);
+  }
+
   ~MetalState() {
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(feat_buf); rel(grad_buf); rel(hess_buf); rel(idx_buf);
     rel(partial_buf); rel(out_buf);
-    rel(pso_partial); rel(pso_partial_indexed); rel(pso_reduce);
-    rel(library); rel(queue); rel(device);
+    ReleaseBinsize(&bs16); ReleaseBinsize(&bs64); ReleaseBinsize(&bs256);
+    rel(queue); rel(device);
   }
 };
 
@@ -239,41 +253,57 @@ void MetalTreeLearner::InitMetal() {
   }
   Log::Info("Metal device: %s", state_->device->name()->utf8String());
 
-  NS::Error* err = nullptr;
-  auto src = NS::String::string(kHistogramKernelSrc, NS::UTF8StringEncoding);
-  auto opts = MTL::CompileOptions::alloc()->init();
-  state_->library = state_->device->newLibrary(src, opts, &err);
-  opts->release();
-  if (!state_->library) {
-    Log::Warning("Metal: MSL compile failed: %s. Falling back to CPU path.",
-                 err ? err->localizedDescription()->utf8String() : "(unknown)");
-    return;
-  }
-
-  auto make_pso = [&](const char* name) -> MTL::ComputePipelineState* {
-    auto nm = NS::String::string(name, NS::UTF8StringEncoding);
-    MTL::Function* fn = state_->library->newFunction(nm);
-    if (!fn) { Log::Warning("Metal: missing kernel function %s", name); return nullptr; }
+  // Compile the kernel three times — once each for 16/64/256-bin variants.
+  auto compile_variant = [&](MetalState::PerBinSize* bs, int num_bins,
+                             int num_subhist) -> bool {
     NS::Error* e = nullptr;
-    MTL::ComputePipelineState* p = state_->device->newComputePipelineState(fn, &e);
-    fn->release();
-    if (!p) {
-      Log::Warning("Metal: pipeline state creation failed (%s): %s", name,
+    auto src = NS::String::string(kHistogramKernelSrc, NS::UTF8StringEncoding);
+    auto opts = MTL::CompileOptions::alloc()->init();
+    // preprocessorMacros: NSDictionary<NSString*, NSObject>.
+    auto k_nb = NS::String::string("NUM_BINS",    NS::UTF8StringEncoding);
+    auto k_ns = NS::String::string("NUM_SUBHIST", NS::UTF8StringEncoding);
+    auto v_nb = NS::Number::number(num_bins);
+    auto v_ns = NS::Number::number(num_subhist);
+    const NS::Object* keys[2]   = { k_nb, k_ns };
+    const NS::Object* values[2] = { v_nb, v_ns };
+    auto macros = NS::Dictionary::dictionary(values, keys, 2);
+    opts->setPreprocessorMacros(macros);
+    bs->library = state_->device->newLibrary(src, opts, &e);
+    opts->release();
+    if (!bs->library) {
+      Log::Warning("Metal: MSL compile (NUM_BINS=%d) failed: %s", num_bins,
                    e ? e->localizedDescription()->utf8String() : "(unknown)");
+      return false;
     }
-    return p;
+    auto make_pso = [&](const char* name) -> MTL::ComputePipelineState* {
+      auto nm = NS::String::string(name, NS::UTF8StringEncoding);
+      MTL::Function* fn = bs->library->newFunction(nm);
+      if (!fn) { Log::Warning("Metal: missing kernel %s in NUM_BINS=%d library",
+                              name, num_bins); return nullptr; }
+      NS::Error* err2 = nullptr;
+      auto p = state_->device->newComputePipelineState(fn, &err2);
+      fn->release();
+      if (!p) Log::Warning("Metal: PSO creation failed (%s, NUM_BINS=%d): %s",
+                           name, num_bins,
+                           err2 ? err2->localizedDescription()->utf8String() : "(unknown)");
+      return p;
+    };
+    bs->pso_partial         = make_pso("histogram_partial");
+    bs->pso_partial_indexed = make_pso("histogram_partial_indexed");
+    bs->pso_reduce          = make_pso("histogram_reduce");
+    return bs->pso_partial && bs->pso_partial_indexed && bs->pso_reduce;
   };
-  state_->pso_partial         = make_pso("histogram_partial");
-  state_->pso_partial_indexed = make_pso("histogram_partial_indexed");
-  state_->pso_reduce          = make_pso("histogram_reduce");
-  if (!state_->pso_partial || !state_->pso_partial_indexed || !state_->pso_reduce) {
-    Log::Warning("Metal: pipeline setup incomplete. Falling back to CPU path.");
+  bool ok = compile_variant(&state_->bs16,  16,  16)
+         && compile_variant(&state_->bs64,  64,  8)
+         && compile_variant(&state_->bs256, 256, 4);
+  if (!ok) {
+    Log::Warning("Metal: kernel compile incomplete. Falling back to CPU path.");
     return;
   }
 
   state_->queue = state_->device->newCommandQueue();
   metal_ready_ = true;
-  Log::Info("Metal: backend initialized (kernels compiled, queue ready).");
+  Log::Info("Metal: backend initialized (16/64/256-bin kernels compiled, queue ready).");
 }
 
 void MetalTreeLearner::TeardownMetal() {
@@ -307,16 +337,28 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
     Log::Info("Metal: skipping acceleration (multi-feature groups detected).");
     return false;
   }
+  int max_num_bin = 0;
   for (int g = 0; g < num_groups; ++g) {
     if (train_data_->IsMultiGroup(g)) {
       Log::Info("Metal: skipping acceleration (multi-val feature group %d).", g);
       return false;
     }
-    if (train_data_->FeatureGroupNumBin(g) > kNumBins) {
+    int nb = train_data_->FeatureGroupNumBin(g);
+    if (nb > kMaxNumBins) {
       Log::Info("Metal: skipping acceleration (group %d has %d bins, > %d).",
-                g, train_data_->FeatureGroupNumBin(g), kNumBins);
+                g, nb, kMaxNumBins);
       return false;
     }
+    if (nb > max_num_bin) max_num_bin = nb;
+  }
+
+  // Pick the smallest kernel variant that fits all features.
+  if (max_num_bin <= 16) {
+    state_->active = &state_->bs16;  state_->active_bins = 16;
+  } else if (max_num_bin <= 64) {
+    state_->active = &state_->bs64;  state_->active_bins = 64;
+  } else {
+    state_->active = &state_->bs256; state_->active_bins = 256;
   }
 
   const data_size_t num_data = train_data_->num_data();
@@ -351,10 +393,10 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   state_->num_data = num_data;
 
   state_->partial_buf = state_->device->newBuffer(
-      (size_t)num_features * (size_t)state_->wg_per_feat * kNumBins * 2 * sizeof(float),
+      (size_t)num_features * (size_t)state_->wg_per_feat * state_->active_bins * 2 * sizeof(float),
       MTL::ResourceStorageModePrivate);
   state_->out_buf = state_->device->newBuffer(
-      (size_t)num_features * kNumBins * 2 * sizeof(float),
+      (size_t)num_features * state_->active_bins * 2 * sizeof(float),
       MTL::ResourceStorageModeShared);
   // Pre-allocate the indices buffer to avoid per-call allocation. Sized for
   // the worst case (all rows in a leaf).
@@ -363,7 +405,8 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
 
   Log::Info("Metal: %d-feature dense buffer materialized (%.1f MB). "
             "wg_per_feat=%d, NUM_BINS=%d.",
-            num_features, feat_bytes / 1048576.0, state_->wg_per_feat, kNumBins);
+            num_features, feat_bytes / 1048576.0, state_->wg_per_feat,
+            state_->active_bins);
   return true;
 }
 
@@ -390,7 +433,7 @@ void MetalTreeLearner::RunMetalHistogram(const score_t* /*gradients*/,
 
   MTL::CommandBuffer* cb = state_->queue->commandBuffer();
   MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
-  enc->setComputePipelineState(state_->pso_partial);
+  enc->setComputePipelineState(state_->active->pso_partial);
   enc->setBuffer(state_->feat_buf, 0, 0);
   enc->setBuffer(state_->grad_buf, 0, 1);
   enc->setBuffer(state_->hess_buf, 0, 2);
@@ -401,13 +444,13 @@ void MetalTreeLearner::RunMetalHistogram(const score_t* /*gradients*/,
       MTL::Size::Make(state_->wg_per_feat, state_->num_metal_features, 1),
       MTL::Size::Make(kThreadsPerGroup, 1, 1));
 
-  enc->setComputePipelineState(state_->pso_reduce);
+  enc->setComputePipelineState(state_->active->pso_reduce);
   enc->setBuffer(state_->partial_buf, 0, 0);
   enc->setBuffer(state_->out_buf, 0, 1);
   enc->setBytes(&wg, sizeof(uint32_t), 2);
   enc->dispatchThreadgroups(
       MTL::Size::Make(state_->num_metal_features, 1, 1),
-      MTL::Size::Make(kNumBins, 1, 1));
+      MTL::Size::Make(state_->active_bins, 1, 1));
   enc->endEncoding();
   cb->commit();
   cb->waitUntilCompleted();
@@ -429,7 +472,7 @@ void MetalTreeLearner::RunMetalHistogramIndexed(const data_size_t* data_indices,
 
   MTL::CommandBuffer* cb = state_->queue->commandBuffer();
   MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
-  enc->setComputePipelineState(state_->pso_partial_indexed);
+  enc->setComputePipelineState(state_->active->pso_partial_indexed);
   enc->setBuffer(state_->feat_buf, 0, 0);
   enc->setBuffer(state_->grad_buf, 0, 1);
   enc->setBuffer(state_->hess_buf, 0, 2);
@@ -442,13 +485,13 @@ void MetalTreeLearner::RunMetalHistogramIndexed(const data_size_t* data_indices,
       MTL::Size::Make(state_->wg_per_feat, state_->num_metal_features, 1),
       MTL::Size::Make(kThreadsPerGroup, 1, 1));
 
-  enc->setComputePipelineState(state_->pso_reduce);
+  enc->setComputePipelineState(state_->active->pso_reduce);
   enc->setBuffer(state_->partial_buf, 0, 0);
   enc->setBuffer(state_->out_buf, 0, 1);
   enc->setBytes(&wg, sizeof(uint32_t), 2);
   enc->dispatchThreadgroups(
       MTL::Size::Make(state_->num_metal_features, 1, 1),
-      MTL::Size::Make(kNumBins, 1, 1));
+      MTL::Size::Make(state_->active_bins, 1, 1));
   enc->endEncoding();
   cb->commit();
   cb->waitUntilCompleted();
@@ -487,7 +530,7 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
     if (!is_feature_used[f]) continue;
     const int num_bin = train_data_->FeatureGroupNumBin(f);
     hist_t* dst = hist_base + 2 * train_data_->GroupBinBoundary(f);
-    const float* src = metal_hist + (size_t)f * kNumBins * 2;
+    const float* src = metal_hist + (size_t)f * state_->active_bins * 2;
     for (int b = 0; b < num_bin; ++b) {
       dst[2 * b + 0] = src[2 * b + 0];
       dst[2 * b + 1] = src[2 * b + 1];
