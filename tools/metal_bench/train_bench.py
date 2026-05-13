@@ -16,8 +16,23 @@ import lightgbm as lgb
 
 CSV_MODE = "--csv" in sys.argv
 
+
+def _system_info() -> str:
+    import platform, subprocess
+    chip = "unknown"
+    try:
+        chip = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
+        ).strip()
+    except Exception:
+        pass
+    return f"{platform.system()} {platform.release()} on {chip}"
+
+
 if CSV_MODE:
     print("num_data,num_features,num_iterations,device,seconds,auc")
+else:
+    print(f"# {_system_info()}")
 
 
 def bench(num_samples: int, num_features: int, num_iterations: int = 50) -> None:
