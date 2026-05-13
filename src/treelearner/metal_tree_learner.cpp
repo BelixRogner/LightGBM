@@ -644,8 +644,13 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
   // Write-back is bounded by num_features * active_bins memory traffic. For
   // typical tabular sizes the absolute work is ~5-50us; OpenMP fork-join
   // overhead (~5us per parallel region) eats into that. Only parallelize if
-  // the work is large enough to amortize the fork-join.
-  const bool parallel_writeback = num_features >= 256;
+  // the work is large enough to amortize the fork-join. Override via env
+  // var if your dataset shape needs a different cutoff.
+  static int writeback_omp_threshold = []() {
+    const char* env = std::getenv("LIGHTGBM_METAL_OMP_WRITEBACK_THRESHOLD");
+    return env ? std::max(1, std::atoi(env)) : 256;
+  }();
+  const bool parallel_writeback = num_features >= writeback_omp_threshold;
   if (parallel_writeback) {
     #pragma omp parallel for schedule(static)
     for (int f = 0; f < num_features; ++f) {
