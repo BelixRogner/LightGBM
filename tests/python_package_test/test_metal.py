@@ -395,6 +395,25 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_min_data_in_leaf_parity():
+    """min_data_in_leaf prevents tiny leaves; common LightGBM regularization
+    knob. Verifies the Metal path respects it correctly."""
+    X, y = make_classification(
+        n_samples=2_000, n_features=128, random_state=36,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=36
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1,
+         "min_data_in_leaf": 100},  # forces shallower-than-default trees
+        X_train, y_train, X_test, y_test, num_rounds=30,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+
+
 def test_verify_mode_smoke():
     """LIGHTGBM_METAL_VERIFY=1 runs CPU alongside Metal and compares.
     Smoke-tests that the mode doesn't crash and produces sensible models
