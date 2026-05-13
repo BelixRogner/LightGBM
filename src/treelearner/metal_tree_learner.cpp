@@ -349,9 +349,11 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   const int num_features = train_data_->num_features();
 
   // Heuristic: Metal dispatch overhead dominates on very narrow datasets where
-  // the GPU is underfilled. Default crossover is ~32 features on M4 Pro
-  // (measured via tools/metal_bench/train_bench.py). Override with the env var.
-  int min_features = 32;
+  // the GPU is underfilled. Empirically (Apple M4 Pro, tools/metal_bench/
+  // train_bench.py), 64-feature workloads regress ~1.2x while 128+ features
+  // see 1.1-1.4x speedups, so we conservatively keep Metal off below 96.
+  // Override with LIGHTGBM_METAL_MIN_FEATURES=N.
+  int min_features = 96;
   if (const char* env = std::getenv("LIGHTGBM_METAL_MIN_FEATURES")) {
     int v = std::atoi(env);
     if (v > 0) min_features = v;
