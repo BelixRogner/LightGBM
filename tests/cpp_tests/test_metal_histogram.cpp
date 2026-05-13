@@ -108,6 +108,52 @@ kernel void histogram_reduce(
     device float* out = out_hist + (uint64_t)feat * NUM_BINS * 2;
     out[2 * bin + 0] = g; out[2 * bin + 1] = h;
 }
+
+kernel void histogram_partial_indexed(
+    device const uchar*  features      [[ buffer(0) ]],
+    device const float*  gradients     [[ buffer(1) ]],
+    device const float*  hessians      [[ buffer(2) ]],
+    device float*        partial_hist  [[ buffer(3) ]],
+    constant uint&       num_data      [[ buffer(4) ]],
+    constant uint&       wg_per_feat   [[ buffer(5) ]],
+    device const uint*   indices       [[ buffer(6) ]],
+    constant uint&       num_idx       [[ buffer(7) ]],
+    uint3 tid3 [[ thread_position_in_threadgroup ]],
+    uint3 gid  [[ threadgroup_position_in_grid ]],
+    uint3 tg3  [[ threads_per_threadgroup ]],
+    uint  sgi  [[ simdgroup_index_in_threadgroup ]])
+{
+    uint tid = tid3.x, tg_sz = tg3.x;
+    threadgroup atomic_uint local_grad[NUM_SUBHIST][NUM_BINS];
+    threadgroup atomic_uint local_hess[NUM_SUBHIST][NUM_BINS];
+    for (uint i = tid; i < NUM_SUBHIST * NUM_BINS; i += tg_sz) {
+        uint s = i / NUM_BINS, b = i % NUM_BINS;
+        atomic_store_explicit(&local_grad[s][b], 0u, memory_order_relaxed);
+        atomic_store_explicit(&local_hess[s][b], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint feat = gid.y, wg = gid.x;
+    uint per = (num_idx + wg_per_feat - 1) / wg_per_feat;
+    uint start = wg * per, end = min(start + per, num_idx);
+    device const uchar* col = features + (uint64_t)feat * num_data;
+    uint sub = sgi % NUM_SUBHIST;
+    for (uint j = start + tid; j < end; j += tg_sz) {
+        uint row = indices[j];
+        uint b = (uint)col[row];
+        atomic_tg_add_f(&local_grad[sub][b], gradients[row]);
+        atomic_tg_add_f(&local_hess[sub][b], hessians[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* out = partial_hist + ((uint64_t)feat * wg_per_feat + wg) * NUM_BINS * 2;
+    for (uint b = tid; b < NUM_BINS; b += tg_sz) {
+        float g = 0.0f, h = 0.0f;
+        for (uint s = 0; s < NUM_SUBHIST; ++s) {
+            g += as_type<float>(atomic_load_explicit(&local_grad[s][b], memory_order_relaxed));
+            h += as_type<float>(atomic_load_explicit(&local_hess[s][b], memory_order_relaxed));
+        }
+        out[2 * b + 0] = g; out[2 * b + 1] = h;
+    }
+}
 )MSL";
 
 void cpu_histogram(const uint8_t* features, const float* gradients, const float* hessians,
@@ -239,6 +285,109 @@ TEST_F(MetalHistogramTest, AgreesWithCPUReference) {
   // Bound: sums of ~12.5k floats each (100k rows / 8 wg / ~1 cell) with
   // ULP-level CAS noise — typically max_rel < 0.01, occasionally up to 0.05.
   EXPECT_LT(max_rel, 0.05) << "max_abs=" << max_abs << " max_rel=" << max_rel;
+}
+
+TEST_F(MetalHistogramTest, IndexedKernelMatchesCPU) {
+  // Exercise the histogram_partial_indexed variant: scatter-gather over a
+  // random subset of rows. Mirrors the deeper-leaf Metal path.
+  const int num_data = 50'000;
+  const int num_features = 16;
+  std::mt19937 rng(99);
+  std::uniform_int_distribution<int> bin_dist(0, kNumBins - 1);
+  std::normal_distribution<float> grad_dist(0.0f, 1.0f);
+
+  std::vector<uint8_t> features((size_t)num_features * num_data);
+  std::vector<float>   gradients(num_data), hessians(num_data);
+  for (auto& x : features)  x = (uint8_t)bin_dist(rng);
+  for (auto& x : gradients) x = grad_dist(rng);
+  for (auto& x : hessians)  x = std::fabs(grad_dist(rng)) + 0.1f;
+
+  // Half the rows, randomly chosen.
+  const int num_idx = num_data / 2;
+  std::vector<uint32_t> indices(num_idx);
+  {
+    std::vector<int> all(num_data);
+    for (int i = 0; i < num_data; ++i) all[i] = i;
+    std::shuffle(all.begin(), all.end(), rng);
+    for (int i = 0; i < num_idx; ++i) indices[i] = (uint32_t)all[i];
+  }
+
+  // CPU reference using the same indices.
+  const size_t hist_elems = (size_t)num_features * kNumBins * 2;
+  std::vector<float> cpu_hist(hist_elems, 0.0f);
+  for (int f = 0; f < num_features; ++f) {
+    float* h = cpu_hist.data() + (size_t)f * kNumBins * 2;
+    const uint8_t* col = features.data() + (size_t)f * num_data;
+    for (int j = 0; j < num_idx; ++j) {
+      uint32_t row = indices[j];
+      uint8_t b = col[row];
+      h[2 * b + 0] += gradients[row];
+      h[2 * b + 1] += hessians[row];
+    }
+  }
+
+  const uint32_t wg_per_feat = 4;
+  MTL::Buffer* fb = ctx.dev->newBuffer(features.data(),  features.size(),
+                                        MTL::ResourceStorageModeShared);
+  MTL::Buffer* gb = ctx.dev->newBuffer(gradients.data(), gradients.size() * sizeof(float),
+                                        MTL::ResourceStorageModeShared);
+  MTL::Buffer* hb = ctx.dev->newBuffer(hessians.data(),  hessians.size() * sizeof(float),
+                                        MTL::ResourceStorageModeShared);
+  MTL::Buffer* ib = ctx.dev->newBuffer(indices.data(),   indices.size() * sizeof(uint32_t),
+                                        MTL::ResourceStorageModeShared);
+  MTL::Buffer* outb = ctx.dev->newBuffer(hist_elems * sizeof(float),
+                                          MTL::ResourceStorageModeShared);
+  MTL::Buffer* partb = ctx.dev->newBuffer(hist_elems * wg_per_feat * sizeof(float),
+                                          MTL::ResourceStorageModePrivate);
+  uint32_t nd = (uint32_t)num_data;
+  uint32_t ni = (uint32_t)num_idx;
+  MTL::Buffer* ndb = ctx.dev->newBuffer(&nd, sizeof(uint32_t),
+                                        MTL::ResourceStorageModeShared);
+  MTL::Buffer* wgb = ctx.dev->newBuffer(&wg_per_feat, sizeof(uint32_t),
+                                        MTL::ResourceStorageModeShared);
+  MTL::Buffer* nib = ctx.dev->newBuffer(&ni, sizeof(uint32_t),
+                                        MTL::ResourceStorageModeShared);
+
+  // Need the indexed pipeline state. Look it up via newFunction since the
+  // helper above only stored partial+reduce; the indexed PSO isn't in the
+  // test ctx but is defined in the same library.
+  auto fn_name = NS::String::string("histogram_partial_indexed",
+                                     NS::UTF8StringEncoding);
+  MTL::Function* fn_idx = ctx.lib->newFunction(fn_name);
+  ASSERT_NE(fn_idx, nullptr);
+  NS::Error* err = nullptr;
+  auto pso_idx = ctx.dev->newComputePipelineState(fn_idx, &err);
+  fn_idx->release();
+  ASSERT_NE(pso_idx, nullptr);
+
+  auto* cb = ctx.q->commandBuffer();
+  auto* enc = cb->computeCommandEncoder();
+  enc->setComputePipelineState(pso_idx);
+  enc->setBuffer(fb, 0, 0); enc->setBuffer(gb, 0, 1); enc->setBuffer(hb, 0, 2);
+  enc->setBuffer(partb, 0, 3); enc->setBuffer(ndb, 0, 4); enc->setBuffer(wgb, 0, 5);
+  enc->setBuffer(ib, 0, 6); enc->setBuffer(nib, 0, 7);
+  enc->dispatchThreadgroups(
+      MTL::Size::Make(wg_per_feat, num_features, 1),
+      MTL::Size::Make(kThreadsPerGroup, 1, 1));
+  enc->setComputePipelineState(ctx.p_red);
+  enc->setBuffer(partb, 0, 0); enc->setBuffer(outb, 0, 1); enc->setBuffer(wgb, 0, 2);
+  enc->dispatchThreadgroups(
+      MTL::Size::Make(num_features, 1, 1),
+      MTL::Size::Make(kNumBins, 1, 1));
+  enc->endEncoding();
+  cb->commit(); cb->waitUntilCompleted();
+
+  const float* metal_hist = static_cast<const float*>(outb->contents());
+  double max_rel = 0.0;
+  for (size_t i = 0; i < hist_elems; ++i) {
+    double denom = std::max((double)std::fabs(cpu_hist[i]), 1e-3);
+    max_rel = std::max(max_rel, std::fabs((double)metal_hist[i] - cpu_hist[i]) / denom);
+  }
+  EXPECT_LT(max_rel, 0.05) << "indexed max_rel=" << max_rel;
+
+  fb->release(); gb->release(); hb->release(); ib->release();
+  outb->release(); partb->release(); ndb->release(); wgb->release(); nib->release();
+  pso_idx->release();
 }
 
 TEST_F(MetalHistogramTest, MatchesAtSmallScale) {
