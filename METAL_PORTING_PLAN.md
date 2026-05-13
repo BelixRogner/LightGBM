@@ -3,6 +3,22 @@
 Goal: add a Metal-based GPU backend (`device_type=metal`) to ExaBoost so training
 on Apple silicon can use the GPU. The OpenCL backend stays untouched.
 
+## Current state (summary)
+
+- ✅ `device_type=metal` end-to-end on Apple M-series, bit-exact AUC vs CPU
+- ✅ 1.09–1.37× end-to-end training speedup on M4 Pro
+- ✅ Multi-binsize kernel dispatch (16 / 64 / 256), auto-selected from data
+- ✅ Indexed-kernel deeper-leaf path; multi-feature-group support
+- ✅ 30 Python parity tests + 3 cpp gtests, all passing
+- ✅ CI: `.github/workflows/metal.yml` on macos-latest (Apple silicon runners)
+- ✅ Comprehensive env-var tuning (`LIGHTGBM_METAL_{MIN_FEATURES,WG_PER_FEAT,
+  MIN_LEAF_ROWS,K_FEATS,OMP_WRITEBACK_THRESHOLD,TIMING}`)
+- ⚠️ Multi-feature kernel (K=2) implemented but not net-faster on M4 Pro;
+  opt-in only via `LIGHTGBM_METAL_K_FEATS=2`
+- ❌ Quantized gradients (`use_quantized_grad=true`) — clean CPU fallback
+  with logged reason, but no Metal acceleration
+- ❌ Sparse / multi-val groups — clean CPU fallback
+
 ## Scope (Phase 2 target)
 
 Mirror the **OpenCL** backend (`USE_GPU`), not CUDA. The OpenCL backend only
