@@ -113,6 +113,13 @@ max_bin boundary, 1024-feature wide, and 100k-row drift stress. Run via
 - `LIGHTGBM_METAL_MIN_LEAF_ROWS=N` (default 0, opt-in): delegate
   ConstructHistograms to CPU when the current leaf has fewer than N rows.
   Useful for highly skewed trees where most rows end up in shallow leaves.
+- `LIGHTGBM_METAL_K_FEATS=2` (default 1, experimental): use the
+  multi-feature kernel that processes 2 adjacent features per threadgroup
+  with shared grad/hess reads. Benchmarks on M4 Pro show this is *not*
+  net-faster, but it remains opt-in for future hardware experimentation.
+- `LIGHTGBM_METAL_OMP_WRITEBACK_THRESHOLD=N` (default 256): minimum
+  num_features required to parallelize the per-feature write-back loop
+  with OpenMP. Below the threshold the loop runs single-threaded.
 - `LIGHTGBM_METAL_TIMING=1`: print per-call timing breakdown at process
   exit (idx_copy / dispatch / gpu_only / writeback).
 
