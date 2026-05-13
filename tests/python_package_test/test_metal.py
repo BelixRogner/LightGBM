@@ -134,6 +134,42 @@ def test_regression_parity():
     assert metal_mse == pytest.approx(cpu_mse, rel=0.05), (cpu_mse, metal_mse)
 
 
+def test_categorical_features_parity():
+    """Mix continuous and explicit categorical features. LightGBM has a
+    separate categorical histogram path; verify Metal acceleration doesn't
+    silently mishandle these (or falls back cleanly)."""
+    rng = np.random.default_rng(7)
+    n = 4_000
+    # 32 continuous + 16 categoricals (each with 8 levels).
+    cont = rng.normal(size=(n, 32))
+    cat = rng.integers(low=0, high=8, size=(n, 16)).astype(float)
+    X = np.concatenate([cont, cat], axis=1)
+    coef = rng.normal(size=X.shape[1])
+    y = (X @ coef + 0.5 * rng.normal(size=n) > 0).astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=7
+    )
+
+    cat_feature_idx = list(range(32, 48))  # which columns are categorical
+    base = dict(
+        objective="binary", num_leaves=31, learning_rate=0.1,
+        verbosity=-1, deterministic=True, seed=42,
+    )
+
+    cpu_ds = lgb.Dataset(X_train, y_train, categorical_feature=cat_feature_idx)
+    cpu_bst = lgb.train(dict(base, device_type="cpu"), cpu_ds, num_boost_round=40)
+    metal_ds = lgb.Dataset(X_train, y_train, categorical_feature=cat_feature_idx)
+    metal_bst = lgb.train(dict(base, device_type="metal"), metal_ds, num_boost_round=40)
+
+    cpu_pred = cpu_bst.predict(X_test)
+    metal_pred = metal_bst.predict(X_test)
+
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.03), (cpu_auc, metal_auc)
+    assert metal_auc > 0.6
+
+
 def test_binary_classification_multifeature_group_parity():
     """Force LightGBM to pack features into multi-feature groups (low max_bin)
     and verify cpu vs metal still match. Exercises the multi-feature-group
