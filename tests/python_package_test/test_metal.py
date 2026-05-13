@@ -402,6 +402,26 @@ def test_quantized_gradient_parity():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.01), (cpu_auc, metal_auc)
 
 
+def test_extra_trees_parity():
+    """extra_trees=true uses random split points instead of greedy
+    optimal. Different code path through FindBestSplits."""
+    X, y = make_classification(
+        n_samples=2_500, n_features=128, random_state=47,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=47
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1,
+         "extra_trees": True},
+        X_train, y_train, X_test, y_test, num_rounds=30,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    # Random splits — wider AUC tolerance.
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.04), (cpu_auc, metal_auc)
+
+
 def test_subsample_freq_parity():
     """bagging_fraction without bagging_freq has different semantics
     (every iter). Verifies that combination."""
