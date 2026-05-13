@@ -18,9 +18,12 @@ on Apple silicon can use the GPU. The OpenCL backend stays untouched.
 - ✅ Quantized gradients (`use_quantized_grad=true`) — Metal-accelerated for
   the 32-bit-histogram case via dedicated q32 kernels; 16-bit-histogram
   leaves still fall back to CPU. Bit-exact AUC vs CPU on smoke tests.
-- ✅ Sparse / multi-val groups — supported. `BinIterator::Get` correctly
-  returns per-sub-feature bin values for sparse-multi-val storage; opt out
-  via `LIGHTGBM_METAL_SKIP_MULTI_VAL=1` if any regressions surface.
+- ⚠️ Sparse / multi-val groups — correctness works (`BinIterator::Get`
+  returns per-sub-feature bins; histograms match CPU bit-exactly), but
+  Metal is ~1.5× *slower* than CPU's sparse-optimized path on real sparse
+  workloads (we materialize the dense column buffer and pay for zeros).
+  Default skips multi-val groups; opt in via
+  `LIGHTGBM_METAL_FORCE_MULTI_VAL=1`.
 
 ## Scope (Phase 2 target)
 

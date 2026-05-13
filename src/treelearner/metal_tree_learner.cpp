@@ -603,17 +603,20 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
 
   // Multi-feature groups (LightGBM packs narrow features together) are OK —
   // FeatureIterator(f) abstracts the packing and we materialize a flat
-  // per-feature column buffer. Multi-val sparse groups: experimentally
-  // BinIterator::Get returns the per-feature bin correctly, so they should
-  // work too; gated behind an opt-out env var in case of subtle bugs.
-  static bool allow_multi_val = []() {
-    const char* env = std::getenv("LIGHTGBM_METAL_SKIP_MULTI_VAL");
-    return env == nullptr || env[0] != '1';
+  // per-feature column buffer. Multi-val sparse groups: BinIterator::Get
+  // does return per-sub-feature bins correctly, but the dense-buffer
+  // materialization loses CPU's sparse-optimized path. Benchmarks show CPU
+  // wins ~1.5x on sparse data, so by default we skip multi-val groups and
+  // delegate to the CPU path. Opt in via LIGHTGBM_METAL_FORCE_MULTI_VAL=1.
+  static bool force_multi_val = []() {
+    const char* env = std::getenv("LIGHTGBM_METAL_FORCE_MULTI_VAL");
+    return env != nullptr && env[0] == '1';
   }();
   for (int g = 0; g < num_groups; ++g) {
-    if (train_data_->IsMultiGroup(g) && !allow_multi_val) {
-      Log::Info("Metal: skipping acceleration (multi-val feature group %d, "
-                "LIGHTGBM_METAL_SKIP_MULTI_VAL=1).", g);
+    if (train_data_->IsMultiGroup(g) && !force_multi_val) {
+      Log::Info("Metal: skipping acceleration (multi-val feature group %d; "
+                "CPU's sparse path is typically faster. Override with "
+                "LIGHTGBM_METAL_FORCE_MULTI_VAL=1).", g);
       return false;
     }
   }
