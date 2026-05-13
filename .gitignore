@@ -463,3 +463,7 @@ dask-worker-space/
 *.pub
 *.rdp
 *_rsa
+
+# Metal test venv
+.venv-metal-test/
+
