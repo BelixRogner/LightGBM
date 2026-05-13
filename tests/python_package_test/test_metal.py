@@ -395,6 +395,26 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_huber_objective_parity():
+    """Huber regression objective has a piecewise-linear gradient. Tests
+    that the Metal histogram path stays correct under non-quadratic
+    objectives."""
+    X, y = make_regression(
+        n_samples=2_500, n_features=96, noise=1.0, random_state=32,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=32
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "huber", "alpha": 0.9, "num_leaves": 31,
+         "learning_rate": 0.1},
+        X_train, y_train, X_test, y_test, num_rounds=30,
+    )
+    cpu_mse = mean_squared_error(y_test, cpu_pred)
+    metal_mse = mean_squared_error(y_test, metal_pred)
+    assert metal_mse == pytest.approx(cpu_mse, rel=0.05), (cpu_mse, metal_mse)
+
+
 def test_k_feats_2_opt_in_parity():
     """LIGHTGBM_METAL_K_FEATS=2 opts into the experimental multi-feature
     kernel. Verifies it still produces AUC parity with CPU even though
