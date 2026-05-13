@@ -268,6 +268,47 @@ def test_binary_classification_multifeature_group_parity():
     assert metal_auc > 0.7
 
 
+def test_lambdarank_parity():
+    """LambdaRank is a pairwise ranking objective with a different gradient
+    pattern from L2 / logistic. Verifies Metal works on ranking workloads."""
+    rng = np.random.default_rng(16)
+    n_queries = 200
+    docs_per_query = 25
+    n = n_queries * docs_per_query
+    X = rng.normal(size=(n, 64))
+    # Relevance labels in [0, 4], correlated with first feature.
+    y = np.clip(np.round(X[:, 0] + 2 + rng.normal(0, 0.5, size=n)), 0, 4).astype(int)
+    group = np.full(n_queries, docs_per_query, dtype=int)
+
+    base = dict(
+        objective="lambdarank", num_leaves=31, learning_rate=0.1,
+        label_gain=[0, 1, 3, 7, 15], verbosity=-1, deterministic=True, seed=42,
+        metric="ndcg", eval_at=[5],
+    )
+    cpu_ds = lgb.Dataset(X, y, group=group)
+    cpu_bst = lgb.train(dict(base, device_type="cpu"), cpu_ds, num_boost_round=30)
+    metal_ds = lgb.Dataset(X, y, group=group)
+    metal_bst = lgb.train(dict(base, device_type="metal"), metal_ds, num_boost_round=30)
+
+    cpu_pred = cpu_bst.predict(X)
+    metal_pred = metal_bst.predict(X)
+    # Spearman-like rank agreement: scores should produce similar orderings.
+    # Use mean pairwise ordering agreement within each query as a check.
+    correct = 0; total = 0
+    for q in range(n_queries):
+        start = q * docs_per_query
+        end = start + docs_per_query
+        c_order = np.argsort(-cpu_pred[start:end])
+        m_order = np.argsort(-metal_pred[start:end])
+        # Compare top-5 sets (looser than full ordering).
+        c_top5 = set(c_order[:5])
+        m_top5 = set(m_order[:5])
+        correct += len(c_top5 & m_top5)
+        total += 5
+    overlap = correct / total
+    assert overlap > 0.85, f"top-5 set overlap: {overlap:.2%}"
+
+
 def test_quantile_regression_parity():
     """quantile objective produces non-trivial gradient/hessian patterns
     different from L2. Verifies the Metal path doesn't make assumptions
