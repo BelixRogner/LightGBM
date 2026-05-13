@@ -177,6 +177,11 @@ double max_rel_diff(const float* a, const float* b, size_t n) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--help") {
+        std::printf("Usage: %s [num_data] [num_features] [iters] [wg_per_feat=auto] [num_subhist=8]\n"
+                    "  Defaults: 1M rows, 64 features, 20 iters\n", argv[0]);
+        return 0;
+    }
     int num_data     = (argc > 1) ? std::atoi(argv[1]) : 1'000'000;
     int num_features = (argc > 2) ? std::atoi(argv[2]) : 64;
     int iters        = (argc > 3) ? std::atoi(argv[3]) : 20;
