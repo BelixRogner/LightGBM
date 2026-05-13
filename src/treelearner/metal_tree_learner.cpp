@@ -602,16 +602,35 @@ void MetalTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature
   // tells us how many leading bins the CPU code keeps implicit. The kernel
   // always emits bins 0..num_bin-1; we copy bins offset..num_bin-1 into
   // RawData[0..num_bin - offset - 1].
-  #pragma omp parallel for schedule(static)
-  for (int f = 0; f < num_features; ++f) {
-    if (!is_feature_used[f]) continue;
-    const int num_bin = per_feature_num_bin_[f];
-    const int offset  = per_feature_offset_[f];
-    hist_t* dst = smaller_leaf_histogram_array_[f].RawData();
-    const float* src = metal_hist + (size_t)f * state_->active_bins * 2;
-    for (int b = offset; b < num_bin; ++b) {
-      dst[2 * (b - offset) + 0] = src[2 * b + 0];
-      dst[2 * (b - offset) + 1] = src[2 * b + 1];
+  // Write-back is bounded by num_features * active_bins memory traffic. For
+  // typical tabular sizes the absolute work is ~5-50us; OpenMP fork-join
+  // overhead (~5us per parallel region) eats into that. Only parallelize if
+  // the work is large enough to amortize the fork-join.
+  const bool parallel_writeback = num_features >= 256;
+  if (parallel_writeback) {
+    #pragma omp parallel for schedule(static)
+    for (int f = 0; f < num_features; ++f) {
+      if (!is_feature_used[f]) continue;
+      const int num_bin = per_feature_num_bin_[f];
+      const int offset  = per_feature_offset_[f];
+      hist_t* dst = smaller_leaf_histogram_array_[f].RawData();
+      const float* src = metal_hist + (size_t)f * state_->active_bins * 2;
+      for (int b = offset; b < num_bin; ++b) {
+        dst[2 * (b - offset) + 0] = src[2 * b + 0];
+        dst[2 * (b - offset) + 1] = src[2 * b + 1];
+      }
+    }
+  } else {
+    for (int f = 0; f < num_features; ++f) {
+      if (!is_feature_used[f]) continue;
+      const int num_bin = per_feature_num_bin_[f];
+      const int offset  = per_feature_offset_[f];
+      hist_t* dst = smaller_leaf_histogram_array_[f].RawData();
+      const float* src = metal_hist + (size_t)f * state_->active_bins * 2;
+      for (int b = offset; b < num_bin; ++b) {
+        dst[2 * (b - offset) + 0] = src[2 * b + 0];
+        dst[2 * (b - offset) + 1] = src[2 * b + 1];
+      }
     }
   }
   if (g_timings.enabled) {
