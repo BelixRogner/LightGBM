@@ -395,6 +395,27 @@ def test_quantized_gradient_falls_back_cleanly():
     assert metal_auc == pytest.approx(cpu_auc, abs=0.001), (cpu_auc, metal_auc)
 
 
+def test_very_many_features():
+    """Stress test: 1024 features. Verifies the auto-tuned wg_per_feat
+    handles wide datasets correctly (wg_per_feat should hit 1 here,
+    exercising the reduce-skipping fast path)."""
+    X, y = make_classification(
+        n_samples=2_000, n_features=1024, n_informative=64, n_redundant=16,
+        random_state=22,
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=22
+    )
+    cpu_pred, metal_pred = _train_both(
+        {"objective": "binary", "num_leaves": 31, "learning_rate": 0.1},
+        X_train, y_train, X_test, y_test, num_rounds=20,
+    )
+    cpu_auc = roc_auc_score(y_test, cpu_pred)
+    metal_auc = roc_auc_score(y_test, metal_pred)
+    assert metal_auc == pytest.approx(cpu_auc, abs=0.02), (cpu_auc, metal_auc)
+    assert metal_auc > 0.7
+
+
 def test_max_bin_boundary():
     """max_bin=255 puts each feature exactly at the 256-bin kernel boundary
     (255 levels + 1 missing-value bin = 256 bins total). Verifies the
