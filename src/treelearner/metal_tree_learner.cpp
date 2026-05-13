@@ -430,8 +430,14 @@ bool MetalTreeLearner::BuildDenseFeatureBuffer() {
   state_->hess_buf = state_->device->newBuffer((size_t)num_data * sizeof(score_t),
                                                MTL::ResourceStorageModeShared);
 
-  // Auto-tune wg_per_feat so a 20-core M-series GPU stays saturated.
+  // Auto-tune wg_per_feat to target ~512 threadgroups (good occupancy on a
+  // 20-core M-series GPU without underfilling on narrow datasets).
+  // Override via LIGHTGBM_METAL_WG_PER_FEAT=N for tuning experiments.
   state_->wg_per_feat = std::max(1, std::min(32, 512 / std::max(num_features, 1)));
+  if (const char* env = std::getenv("LIGHTGBM_METAL_WG_PER_FEAT")) {
+    int v = std::atoi(env);
+    if (v > 0) state_->wg_per_feat = std::min(v, 64);
+  }
   state_->num_metal_features = num_features;
   state_->num_data = num_data;
 
