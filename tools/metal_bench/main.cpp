@@ -33,15 +33,21 @@ namespace {
 constexpr int kNumBins = 256;
 constexpr int kThreadsPerGroup = 256;
 
+// Tuned kernel: per-SIMD-group sub-histograms + workgroups-per-feature tiling.
+// - SUBHIST: N copies of the histogram in threadgroup memory, one per SIMD
+//   group, cuts atomic contention N-fold. Final reduction sums the copies.
+// - WG_PER_FEAT: launch multiple threadgroups per feature, each handling a
+//   row-stride. Output goes to per-WG slot in partial_hist; a second kernel
+//   sums across the WG dimension. Fixes GPU underfill on narrow datasets.
 const char* kMetalKernelSrc = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint NUM_BINS = 256;
+constant uint NUM_BINS    = 256;
+#ifndef NUM_SUBHIST
+#define NUM_SUBHIST 8u   // simdgroups_per_threadgroup at 256 threads
+#endif
 
-// MSL on this system lacks threadgroup atomic_float, so we mirror the
-// LightGBM OpenCL pattern: store float histograms as uint bit-patterns in
-// threadgroup memory and atomic-add via compare-exchange CAS loop.
 inline void atomic_tg_add_f(threadgroup atomic_uint* addr, float val) {
     uint expected = atomic_load_explicit(addr, memory_order_relaxed);
     uint desired;
@@ -53,40 +59,86 @@ inline void atomic_tg_add_f(threadgroup atomic_uint* addr, float val) {
         memory_order_relaxed, memory_order_relaxed));
 }
 
-// One threadgroup per feature. Each thread strides over rows, CAS-adds into
-// a threadgroup-local histogram, then writes its slice to device memory.
-kernel void histogram_kernel(
-    device const uchar*  features    [[ buffer(0) ]],  // [num_features * num_data], features[f*num_data + i]
-    device const float*  gradients   [[ buffer(1) ]],  // [num_data]
-    device const float*  hessians    [[ buffer(2) ]],  // [num_data]
-    device float*        out_hist    [[ buffer(3) ]],  // [num_features * NUM_BINS * 2]
-    constant uint&       num_data    [[ buffer(4) ]],
-    uint tid    [[ thread_position_in_threadgroup ]],
-    uint gid    [[ threadgroup_position_in_grid ]],
-    uint tg_sz  [[ threads_per_threadgroup ]])
+// Builds a partial histogram for (feature, wg-in-feature) into partial_hist.
+// Grid layout: dispatchThreadgroups(MTL::Size(wg_per_feat, num_features, 1)).
+// Threadgroup size: (256, 1, 1).
+kernel void histogram_partial(
+    device const uchar*  features      [[ buffer(0) ]],  // [num_features * num_data]
+    device const float*  gradients     [[ buffer(1) ]],  // [num_data]
+    device const float*  hessians      [[ buffer(2) ]],  // [num_data]
+    device float*        partial_hist  [[ buffer(3) ]],  // [num_features * wg_per_feat * NUM_BINS * 2]
+    constant uint&       num_data      [[ buffer(4) ]],
+    constant uint&       wg_per_feat   [[ buffer(5) ]],
+    uint3 tid3      [[ thread_position_in_threadgroup ]],
+    uint3 gid       [[ threadgroup_position_in_grid ]],
+    uint3 tg_sz3    [[ threads_per_threadgroup ]],
+    uint  sg_idx    [[ simdgroup_index_in_threadgroup ]])
 {
-    threadgroup atomic_uint local_grad[NUM_BINS];
-    threadgroup atomic_uint local_hess[NUM_BINS];
+    uint tid   = tid3.x;
+    uint tg_sz = tg_sz3.x;
 
-    for (uint b = tid; b < NUM_BINS; b += tg_sz) {
-        atomic_store_explicit(&local_grad[b], 0u, memory_order_relaxed);
-        atomic_store_explicit(&local_hess[b], 0u, memory_order_relaxed);
+    threadgroup atomic_uint local_grad[NUM_SUBHIST][NUM_BINS];
+    threadgroup atomic_uint local_hess[NUM_SUBHIST][NUM_BINS];
+
+    // Zero all sub-histograms.
+    for (uint i = tid; i < NUM_SUBHIST * NUM_BINS; i += tg_sz) {
+        uint s = i / NUM_BINS, b = i % NUM_BINS;
+        atomic_store_explicit(&local_grad[s][b], 0u, memory_order_relaxed);
+        atomic_store_explicit(&local_hess[s][b], 0u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device const uchar* feat_col = features + (uint64_t)gid * num_data;
-    for (uint i = tid; i < num_data; i += tg_sz) {
+    uint feat_id     = gid.y;
+    uint wg_in_feat  = gid.x;
+
+    // Row range for this WG. Each WG processes a contiguous slice.
+    uint per_wg = (num_data + wg_per_feat - 1) / wg_per_feat;
+    uint start  = wg_in_feat * per_wg;
+    uint end    = min(start + per_wg, num_data);
+
+    device const uchar* feat_col = features + (uint64_t)feat_id * num_data;
+    uint sub = sg_idx % NUM_SUBHIST;  // map each SIMD group to its own sub-histogram
+    for (uint i = start + tid; i < end; i += tg_sz) {
         uint bin = (uint)feat_col[i];
-        atomic_tg_add_f(&local_grad[bin], gradients[i]);
-        atomic_tg_add_f(&local_hess[bin], hessians[i]);
+        atomic_tg_add_f(&local_grad[sub][bin], gradients[i]);
+        atomic_tg_add_f(&local_hess[sub][bin], hessians[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float* out = out_hist + (uint64_t)gid * NUM_BINS * 2;
+    // Reduce sub-histograms and write out.
+    device float* out =
+        partial_hist + ((uint64_t)feat_id * wg_per_feat + wg_in_feat) * NUM_BINS * 2;
     for (uint b = tid; b < NUM_BINS; b += tg_sz) {
-        out[2 * b + 0] = as_type<float>(atomic_load_explicit(&local_grad[b], memory_order_relaxed));
-        out[2 * b + 1] = as_type<float>(atomic_load_explicit(&local_hess[b], memory_order_relaxed));
+        float g = 0.0f, h = 0.0f;
+        for (uint s = 0; s < NUM_SUBHIST; ++s) {
+            g += as_type<float>(atomic_load_explicit(&local_grad[s][b], memory_order_relaxed));
+            h += as_type<float>(atomic_load_explicit(&local_hess[s][b], memory_order_relaxed));
+        }
+        out[2 * b + 0] = g;
+        out[2 * b + 1] = h;
     }
+}
+
+// Sums partial_hist across the wg-in-feature dimension into out_hist.
+// Grid: dispatchThreadgroups(MTL::Size(num_features, 1, 1)); tg_size NUM_BINS.
+kernel void histogram_reduce(
+    device const float*  partial_hist  [[ buffer(0) ]],  // [num_features * wg_per_feat * NUM_BINS * 2]
+    device float*        out_hist      [[ buffer(1) ]],  // [num_features * NUM_BINS * 2]
+    constant uint&       wg_per_feat   [[ buffer(2) ]],
+    uint tid [[ thread_position_in_threadgroup ]],
+    uint gid [[ threadgroup_position_in_grid ]])
+{
+    uint feat_id = gid;
+    uint bin     = tid;
+    float g = 0.0f, h = 0.0f;
+    for (uint w = 0; w < wg_per_feat; ++w) {
+        device const float* p = partial_hist + ((uint64_t)feat_id * wg_per_feat + w) * NUM_BINS * 2;
+        g += p[2 * bin + 0];
+        h += p[2 * bin + 1];
+    }
+    device float* out = out_hist + (uint64_t)feat_id * NUM_BINS * 2;
+    out[2 * bin + 0] = g;
+    out[2 * bin + 1] = h;
 }
 )MSL";
 
@@ -128,9 +180,17 @@ int main(int argc, char** argv) {
     int num_data     = (argc > 1) ? std::atoi(argv[1]) : 1'000'000;
     int num_features = (argc > 2) ? std::atoi(argv[2]) : 64;
     int iters        = (argc > 3) ? std::atoi(argv[3]) : 20;
+    int wg_per_feat  = (argc > 4) ? std::atoi(argv[4]) : 0;  // 0 = auto
+    int num_subhist  = (argc > 5) ? std::atoi(argv[5]) : 8;  // sub-hists per threadgroup
 
-    std::printf("Config: num_data=%d, num_features=%d, num_bins=%d, iters=%d\n",
-                num_data, num_features, kNumBins, iters);
+    if (wg_per_feat <= 0) {
+        // Target ~512 threadgroups so a 20-core M-series GPU stays saturated.
+        wg_per_feat = std::max(1, 512 / std::max(num_features, 1));
+        wg_per_feat = std::min(wg_per_feat, 32);
+    }
+
+    std::printf("Config: num_data=%d, num_features=%d, num_bins=%d, iters=%d, wg_per_feat=%d, num_subhist=%d\n",
+                num_data, num_features, kNumBins, iters, wg_per_feat, num_subhist);
 
     // ---- Synthetic data ----
     std::mt19937 rng(42);
@@ -176,6 +236,14 @@ int main(int argc, char** argv) {
     NS::Error* err = nullptr;
     auto src_nsstring = NS::String::string(kMetalKernelSrc, NS::UTF8StringEncoding);
     auto compile_opts = MTL::CompileOptions::alloc()->init();
+    {
+        auto k_subhist = NS::String::string("NUM_SUBHIST", NS::UTF8StringEncoding);
+        auto v_subhist = NS::Number::number((int)num_subhist);
+        const NS::Object* values[1] = { v_subhist };
+        const NS::Object* keys[1]   = { k_subhist };
+        auto macros = NS::Dictionary::dictionary(values, keys, 1);
+        compile_opts->setPreprocessorMacros(macros);
+    }
     MTL::Library* library = device->newLibrary(src_nsstring, compile_opts, &err);
     compile_opts->release();
     if (!library) {
@@ -184,14 +252,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto fn_name = NS::String::string("histogram_kernel", NS::UTF8StringEncoding);
-    MTL::Function* fn = library->newFunction(fn_name);
-    MTL::ComputePipelineState* pso = device->newComputePipelineState(fn, &err);
-    if (!pso) {
-        std::fprintf(stderr, "Pipeline state error: %s\n",
-                     err ? err->localizedDescription()->utf8String() : "(null)");
-        return 1;
-    }
+    auto make_pso = [&](const char* name) -> MTL::ComputePipelineState* {
+        auto nm = NS::String::string(name, NS::UTF8StringEncoding);
+        MTL::Function* fn = library->newFunction(nm);
+        if (!fn) { std::fprintf(stderr, "newFunction(%s) failed\n", name); std::exit(1); }
+        NS::Error* e = nullptr;
+        MTL::ComputePipelineState* p = device->newComputePipelineState(fn, &e);
+        fn->release();
+        if (!p) {
+            std::fprintf(stderr, "PSO(%s) error: %s\n", name,
+                         e ? e->localizedDescription()->utf8String() : "(null)");
+            std::exit(1);
+        }
+        return p;
+    };
+    MTL::ComputePipelineState* pso_partial = make_pso("histogram_partial");
+    MTL::ComputePipelineState* pso_reduce  = make_pso("histogram_reduce");
 
     MTL::CommandQueue* queue = device->newCommandQueue();
 
@@ -204,22 +280,38 @@ int main(int argc, char** argv) {
                                               MTL::ResourceStorageModeShared);
     MTL::Buffer* out_buf  = device->newBuffer(hist_elems * sizeof(float),
                                               MTL::ResourceStorageModeShared);
-    uint32_t num_data_u = (uint32_t)num_data;
-    MTL::Buffer* n_buf   = device->newBuffer(&num_data_u, sizeof(uint32_t),
-                                             MTL::ResourceStorageModeShared);
+    const size_t partial_elems = hist_elems * (size_t)wg_per_feat;
+    MTL::Buffer* part_buf = device->newBuffer(partial_elems * sizeof(float),
+                                              MTL::ResourceStorageModePrivate);
+    uint32_t num_data_u   = (uint32_t)num_data;
+    uint32_t wg_per_feat_u = (uint32_t)wg_per_feat;
+    MTL::Buffer* n_buf  = device->newBuffer(&num_data_u,    sizeof(uint32_t),
+                                            MTL::ResourceStorageModeShared);
+    MTL::Buffer* wg_buf = device->newBuffer(&wg_per_feat_u, sizeof(uint32_t),
+                                            MTL::ResourceStorageModeShared);
 
     auto dispatch_one = [&]() {
         MTL::CommandBuffer* cb = queue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
-        enc->setComputePipelineState(pso);
+        // Partial histograms.
+        enc->setComputePipelineState(pso_partial);
         enc->setBuffer(feat_buf, 0, 0);
         enc->setBuffer(grad_buf, 0, 1);
         enc->setBuffer(hess_buf, 0, 2);
-        enc->setBuffer(out_buf,  0, 3);
+        enc->setBuffer(part_buf, 0, 3);
         enc->setBuffer(n_buf,    0, 4);
-        MTL::Size grid    = MTL::Size::Make(num_features, 1, 1);
-        MTL::Size tg_size = MTL::Size::Make(kThreadsPerGroup, 1, 1);
-        enc->dispatchThreadgroups(grid, tg_size);
+        enc->setBuffer(wg_buf,   0, 5);
+        enc->dispatchThreadgroups(
+            MTL::Size::Make(wg_per_feat, num_features, 1),
+            MTL::Size::Make(kThreadsPerGroup, 1, 1));
+        // Reduce across wg-per-feature dim.
+        enc->setComputePipelineState(pso_reduce);
+        enc->setBuffer(part_buf, 0, 0);
+        enc->setBuffer(out_buf,  0, 1);
+        enc->setBuffer(wg_buf,   0, 2);
+        enc->dispatchThreadgroups(
+            MTL::Size::Make(num_features, 1, 1),
+            MTL::Size::Make(kNumBins, 1, 1));
         enc->endEncoding();
         cb->commit();
         cb->waitUntilCompleted();
@@ -242,8 +334,9 @@ int main(int argc, char** argv) {
     std::printf("Diff   : max_abs=%.6f max_rel=%.6f\n", abs_d, rel_d);
 
     feat_buf->release(); grad_buf->release(); hess_buf->release();
-    out_buf->release();  n_buf->release();
-    queue->release(); pso->release(); fn->release(); library->release(); device->release();
+    out_buf->release();  part_buf->release(); n_buf->release(); wg_buf->release();
+    queue->release(); pso_partial->release(); pso_reduce->release();
+    library->release(); device->release();
     pool->release();
     return 0;
 }
