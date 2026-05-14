@@ -198,6 +198,114 @@ kernel void histogram_partial_k2(
     }
 }
 
+// ---- Register-private histogram kernels (low-bin only, NUM_BINS <= 16) ----
+//
+// On low-bin workloads (Numerai-style 5-bin storage that selects the 16-bin
+// kernel variant) the threadgroup-atomic kernel is atomic-contention bound:
+// ~500k CAS-loop float adds per threadgroup. This variant gives each thread
+// NUM_BINS private register accumulators (kept in registers via the unrolled
+// switch over the bin value), then merges the 256 per-thread histograms
+// into one threadgroup-shared histogram via NUM_BINS atomic adds per thread.
+// Atomic op count drops from ~500k to 256*NUM_BINS = ~4k per dispatch.
+#if NUM_BINS == 16
+kernel void histogram_partial_regs(
+    device const uchar*  features      [[ buffer(0) ]],
+    device const float*  gradients     [[ buffer(1) ]],
+    device const float*  hessians      [[ buffer(2) ]],
+    device float*        partial_hist  [[ buffer(3) ]],
+    constant uint&       num_data      [[ buffer(4) ]],
+    constant uint&       wg_per_feat   [[ buffer(5) ]],
+    uint3 tid3      [[ thread_position_in_threadgroup ]],
+    uint3 gid       [[ threadgroup_position_in_grid ]],
+    uint3 tg_sz3    [[ threads_per_threadgroup ]])
+{
+    uint tid   = tid3.x;
+    uint tg_sz = tg_sz3.x;
+    uint feat_id    = gid.y;
+    uint wg_in_feat = gid.x;
+    uint per_wg     = (num_data + wg_per_feat - 1) / wg_per_feat;
+    uint start      = wg_in_feat * per_wg;
+    uint end        = min(start + per_wg, num_data);
+    device const uchar* feat_col = features + (uint64_t)feat_id * num_data;
+
+    // Per-thread register-allocated bin accumulators.
+    float g0=0,g1=0,g2=0,g3=0,g4=0,g5=0,g6=0,g7=0,g8=0,g9=0,gA=0,gB=0,gC=0,gD=0,gE=0,gF=0;
+    float h0=0,h1=0,h2=0,h3=0,h4=0,h5=0,h6=0,h7=0,h8=0,h9=0,hA=0,hB=0,hC=0,hD=0,hE=0,hF=0;
+    for (uint i = start + tid; i < end; i += tg_sz) {
+        uint b = (uint)feat_col[i];
+        float g = gradients[i];
+        float h = hessians[i];
+        switch (b) {
+            case  0: g0 += g; h0 += h; break;
+            case  1: g1 += g; h1 += h; break;
+            case  2: g2 += g; h2 += h; break;
+            case  3: g3 += g; h3 += h; break;
+            case  4: g4 += g; h4 += h; break;
+            case  5: g5 += g; h5 += h; break;
+            case  6: g6 += g; h6 += h; break;
+            case  7: g7 += g; h7 += h; break;
+            case  8: g8 += g; h8 += h; break;
+            case  9: g9 += g; h9 += h; break;
+            case 10: gA += g; hA += h; break;
+            case 11: gB += g; hB += h; break;
+            case 12: gC += g; hC += h; break;
+            case 13: gD += g; hD += h; break;
+            case 14: gE += g; hE += h; break;
+            case 15: gF += g; hF += h; break;
+        }
+    }
+    // Merge: each thread adds its 16 sums to a shared atomic histogram.
+    threadgroup atomic_uint shared_g[NUM_BINS];
+    threadgroup atomic_uint shared_h[NUM_BINS];
+    if (tid < NUM_BINS) {
+        atomic_store_explicit(&shared_g[tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&shared_h[tid], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (g0 != 0.0f) atomic_tg_add_f(&shared_g[ 0], g0);
+    if (h0 != 0.0f) atomic_tg_add_f(&shared_h[ 0], h0);
+    if (g1 != 0.0f) atomic_tg_add_f(&shared_g[ 1], g1);
+    if (h1 != 0.0f) atomic_tg_add_f(&shared_h[ 1], h1);
+    if (g2 != 0.0f) atomic_tg_add_f(&shared_g[ 2], g2);
+    if (h2 != 0.0f) atomic_tg_add_f(&shared_h[ 2], h2);
+    if (g3 != 0.0f) atomic_tg_add_f(&shared_g[ 3], g3);
+    if (h3 != 0.0f) atomic_tg_add_f(&shared_h[ 3], h3);
+    if (g4 != 0.0f) atomic_tg_add_f(&shared_g[ 4], g4);
+    if (h4 != 0.0f) atomic_tg_add_f(&shared_h[ 4], h4);
+    if (g5 != 0.0f) atomic_tg_add_f(&shared_g[ 5], g5);
+    if (h5 != 0.0f) atomic_tg_add_f(&shared_h[ 5], h5);
+    if (g6 != 0.0f) atomic_tg_add_f(&shared_g[ 6], g6);
+    if (h6 != 0.0f) atomic_tg_add_f(&shared_h[ 6], h6);
+    if (g7 != 0.0f) atomic_tg_add_f(&shared_g[ 7], g7);
+    if (h7 != 0.0f) atomic_tg_add_f(&shared_h[ 7], h7);
+    if (g8 != 0.0f) atomic_tg_add_f(&shared_g[ 8], g8);
+    if (h8 != 0.0f) atomic_tg_add_f(&shared_h[ 8], h8);
+    if (g9 != 0.0f) atomic_tg_add_f(&shared_g[ 9], g9);
+    if (h9 != 0.0f) atomic_tg_add_f(&shared_h[ 9], h9);
+    if (gA != 0.0f) atomic_tg_add_f(&shared_g[10], gA);
+    if (hA != 0.0f) atomic_tg_add_f(&shared_h[10], hA);
+    if (gB != 0.0f) atomic_tg_add_f(&shared_g[11], gB);
+    if (hB != 0.0f) atomic_tg_add_f(&shared_h[11], hB);
+    if (gC != 0.0f) atomic_tg_add_f(&shared_g[12], gC);
+    if (hC != 0.0f) atomic_tg_add_f(&shared_h[12], hC);
+    if (gD != 0.0f) atomic_tg_add_f(&shared_g[13], gD);
+    if (hD != 0.0f) atomic_tg_add_f(&shared_h[13], hD);
+    if (gE != 0.0f) atomic_tg_add_f(&shared_g[14], gE);
+    if (hE != 0.0f) atomic_tg_add_f(&shared_h[14], hE);
+    if (gF != 0.0f) atomic_tg_add_f(&shared_g[15], gF);
+    if (hF != 0.0f) atomic_tg_add_f(&shared_h[15], hF);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* out = partial_hist +
+        ((uint64_t)feat_id * wg_per_feat + wg_in_feat) * NUM_BINS * 2;
+    if (tid < NUM_BINS) {
+        out[2 * tid + 0] = as_type<float>(atomic_load_explicit(&shared_g[tid], memory_order_relaxed));
+        out[2 * tid + 1] = as_type<float>(atomic_load_explicit(&shared_h[tid], memory_order_relaxed));
+    }
+}
+#endif // NUM_BINS == 16
+
 // ---- Quantized-gradient kernels (use_quantized_grad=true, 32-bit case) ----
 
 // Reads int8 packed grad+hess (byte 2*i = grad, byte 2*i+1 = hess),
@@ -430,6 +538,7 @@ struct MetalTreeLearner::MetalState {
     MTL::ComputePipelineState* pso_partial_k2          = nullptr;  // multi-feature variant
     MTL::ComputePipelineState* pso_partial_q32         = nullptr;  // quantized 32-bit
     MTL::ComputePipelineState* pso_partial_q32_indexed = nullptr;
+    MTL::ComputePipelineState* pso_partial_regs        = nullptr;  // 16-bin only
     MTL::ComputePipelineState* pso_reduce              = nullptr;
     MTL::ComputePipelineState* pso_reduce_q32          = nullptr;
   };
@@ -473,6 +582,7 @@ struct MetalTreeLearner::MetalState {
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(bs->pso_partial); rel(bs->pso_partial_indexed); rel(bs->pso_partial_k2);
     rel(bs->pso_partial_q32); rel(bs->pso_partial_q32_indexed);
+    rel(bs->pso_partial_regs);
     rel(bs->pso_reduce); rel(bs->pso_reduce_q32);
     rel(bs->library);
   }
@@ -634,11 +744,16 @@ void MetalTreeLearner::InitMetal() {
     bs->pso_partial_q32_indexed = make_pso("histogram_partial_q32_indexed");
     bs->pso_reduce              = make_pso("histogram_reduce");
     bs->pso_reduce_q32          = make_pso("histogram_reduce_q32");
+    // pso_partial_regs is 16-bin-only (NUM_BINS==16 guard in MSL).
+    if (num_bins == 16) {
+      bs->pso_partial_regs = make_pso("histogram_partial_regs");
+    }
     return bs->pso_partial && bs->pso_partial_indexed && bs->pso_partial_k2
         && bs->pso_partial_q32 && bs->pso_partial_q32_indexed
-        && bs->pso_reduce && bs->pso_reduce_q32;
+        && bs->pso_reduce && bs->pso_reduce_q32
+        && (num_bins != 16 || bs->pso_partial_regs);
   };
-  bool ok = compile_variant(&state_->bs16,  16,  16)
+  bool ok = compile_variant(&state_->bs16,  16,  32)
          && compile_variant(&state_->bs64,  64,  8)
          && compile_variant(&state_->bs256, 256, 4);
   if (!ok) {
@@ -875,7 +990,10 @@ void MetalTreeLearner::RunMetalHistogram(const score_t* /*gradients*/,
   if (state_->k_feats == 2) {
     enc->setComputePipelineState(state_->active->pso_partial_k2);
   } else {
-    enc->setComputePipelineState(state_->active->pso_partial);
+    enc->setComputePipelineState(
+        state_->active_bins == 16 && state_->active->pso_partial_regs
+            ? state_->active->pso_partial_regs
+            : state_->active->pso_partial);
   }
   enc->setBuffer(state_->feat_buf, 0, 0);
   enc->setBuffer(state_->grad_buf, 0, 1);
@@ -1001,7 +1119,10 @@ void MetalTreeLearner::RunMetalHistogramSibling(
   enc->setBytes(&nd, sizeof(uint32_t), 4);
   enc->setBytes(&wg, sizeof(uint32_t), 5);
   if (smaller_full) {
-    enc->setComputePipelineState(state_->active->pso_partial);
+    enc->setComputePipelineState(
+        state_->active_bins == 16 && state_->active->pso_partial_regs
+            ? state_->active->pso_partial_regs
+            : state_->active->pso_partial);
   } else {
     enc->setComputePipelineState(state_->active->pso_partial_indexed);
     enc->setBuffer(state_->idx_buf, 0, 6);
@@ -1028,7 +1149,10 @@ void MetalTreeLearner::RunMetalHistogramSibling(
   enc->setBytes(&nd, sizeof(uint32_t), 4);
   enc->setBytes(&wg, sizeof(uint32_t), 5);
   if (larger_full) {
-    enc->setComputePipelineState(state_->active->pso_partial);
+    enc->setComputePipelineState(
+        state_->active_bins == 16 && state_->active->pso_partial_regs
+            ? state_->active->pso_partial_regs
+            : state_->active->pso_partial);
   } else {
     enc->setComputePipelineState(state_->active->pso_partial_indexed);
     enc->setBuffer(state_->idx_buf_larger, 0, 6);
